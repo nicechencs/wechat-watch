@@ -42,7 +42,7 @@ list.png ──sha256── list.sha256   thread.png（只用来判断滚没滚�
 
 裁剪跟找到的微信窗口走（`WECHAT_WINDOW=WxH+X+Y` 或 `X,Y,W,H`，或只读解析 `xwininfo -root -tree` / `wmctrl -lG`）；找不到再用上面的 1280×800 常量。
 
-**窗口移动 / 缩放 / DPI（诚实说明）：** 窗口**移动**后，只要 `find_window` 拿到矩形（`WECHAT_WINDOW` / root-tree / `wmctrl -lG`），裁剪会跟着平移，这一步已经可用。窗口被拉窄、或用户拖了列表|对话区分隔线（**resize**）时，固定的 `NAV_INSET=1`、`LIST_INSET=63`、`THREAD_INSET=282` **不会**跟着分隔线走，窄窗或拖过的 list|thread 线会裁到错误的栏；`--window-geom --window-png` 会在窗口内部扫描竖向 gutter（分隔线）来跟栏。高度上若直接用整窗 `win_h`，会把标题栏、搜索框、输入框/发送都包进去（旧的最大化路径用的是 `+30/700` 和 `+40/660`）。150% / 200% 等分数缩放（DPI）**仍未处理**：像素 inset 会对不上，需要真实像素矩形再扫描，不能凭空缩放未知布局。
+**窗口移动 / 缩放 / DPI（诚实说明）：** 窗口**移动**后，只要 `find_window` 拿到矩形（`WECHAT_WINDOW` / root-tree / `wmctrl -lG`），裁剪会跟着平移，这一步已经可用。窗口被拉窄、或用户拖了列表|对话区分隔线（**resize**）时，固定的 `NAV_INSET=1`、`LIST_INSET=63`、`THREAD_INSET=282` **不会**跟着分隔线走，窄窗或拖过的 list|thread 线会裁到错误的栏；`--window-geom --window-png` 会在窗口内部扫描竖向 gutter（分隔线）来跟栏。高度上若直接用整窗 `win_h`，会把标题栏、搜索框、输入框/发送都包进去（旧的最大化路径用的是 `+30/700` 和 `+40/660`）。150% / 200% 等分数缩放（DPI）**仍未处理**：像素 inset 会对不上，需要真实像素矩形再扫描，不能凭空缩放未知布局。实况 `wechat-watch-diff` / `wechat-watch-thread` 现在会写下 `watch/window.png` 并传给 `--window-png`，拖分隔线后裁剪会更新；150%/200% 分数 DPI 仍不会自动处理。
 
 ## 翻历史、有滚动条才录屏
 
@@ -185,7 +185,7 @@ kind1=image
 # 当前微信窗口矩形 + nav/list/thread 裁剪（找不到则 1280x800 常量）
 ./wechat-watch-regions --window-geom
 # 有窗口截图时扫描 gutter，list/thread 跟分隔线而不是固定 63/282
-./wechat-watch-regions --window-geom --window-png "$WECHAT_PERSIST/watch/full.png"
+./wechat-watch-regions --window-geom --window-png "$WECHAT_PERSIST/watch/window.png"
 ```
 
 ## 区域差分规则

@@ -18,6 +18,9 @@ REGIONS_DIR="$STATE_DIR/regions"
 REGIONS_JSON="$STATE_DIR/regions.json"
 THREAD="$STATE_DIR/thread.png"
 THREAD_PREV="$STATE_DIR/thread.prev.png"
+WINDOW_PNG="$STATE_DIR/window.png"
+WINDOW_SHA="$STATE_DIR/window.sha256"
+WINDOW_BOXES="$STATE_DIR/window.boxes"
 IDENTITIES="$STATE_DIR/identities.json"
 AVATARS_DIR="$STATE_DIR/avatars"
 CLIPS_DIR="$STATE_DIR/clips"
@@ -47,7 +50,7 @@ do
 done
 
 # Left chat list. Excludes compose + dock.
-# Defaults: maximized 1280x800. --window-geom overrides if it succeeds.
+# Defaults: maximized 1280x800. Live --window-png overrides if it succeeds.
 CROP_W=440
 CROP_H=700
 CROP_X=70
@@ -62,30 +65,8 @@ THREAD_H=660
 THREAD_X=414
 THREAD_Y=40
 
-# Prefer live window rect (env / xwininfo / wmctrl). Keep constants if it fails.
-if [ -n "${REGIONS_PY}" ] && command -v python3 >/dev/null 2>&1; then
-  _geom="$(python3 "$REGIONS_PY" --window-geom 2>/dev/null || true)"
-  if [ -n "${_geom}" ]; then
-    _list="$(printf '%s\n' "$_geom" | awk -F= '/^list=/{print $2; exit}')"
-    _thread="$(printf '%s\n' "$_geom" | awk -F= '/^thread=/{print $2; exit}')"
-    if printf '%s' "${_list:-}" | grep -Eq '^-?[0-9]+,-?[0-9]+,[1-9][0-9]*,[1-9][0-9]*$'; then
-      IFS=',' read -r CROP_X CROP_Y CROP_W CROP_H <<EOF
-$_list
-EOF
-    fi
-    if printf '%s' "${_thread:-}" | grep -Eq '^-?[0-9]+,-?[0-9]+,[1-9][0-9]*,[1-9][0-9]*$'; then
-      IFS=',' read -r THREAD_X THREAD_Y THREAD_W THREAD_H <<EOF
-$_thread
-EOF
-    fi
-  fi
-  unset _geom _list _thread
-fi
-
 SCROLL_SECS="${WECHAT_SCROLL_SECS:-4}"
 SCROLL_FPS="${WECHAT_SCROLL_FPS:-4}"
-
-mkdir -p "$STATE_DIR"
 
 find_ffmpeg() {
   if [ -x "$PERSIST_FFMPEG" ]; then
@@ -107,6 +88,8 @@ if ! FFMPEG=$(find_ffmpeg); then
     exit 1
   fi
 fi
+
+mkdir -p "$STATE_DIR"
 
 run_gc() {
   if [ -n "${GC_SH}" ]; then
@@ -130,9 +113,81 @@ if [ -f "$THREAD_PREV" ]; then
   HAD_PREV_THREAD=1
 fi
 
+apply_list_thread() {
+  local _list="$1"
+  local _thread="$2"
+  if printf '%s' "${_list:-}" | grep -Eq '^-?[0-9]+,-?[0-9]+,[1-9][0-9]*,[1-9][0-9]*$'; then
+    IFS=',' read -r CROP_X CROP_Y CROP_W CROP_H <<EOF
+$_list
+EOF
+  fi
+  if printf '%s' "${_thread:-}" | grep -Eq '^-?[0-9]+,-?[0-9]+,[1-9][0-9]*,[1-9][0-9]*$'; then
+    IFS=',' read -r THREAD_X THREAD_Y THREAD_W THREAD_H <<EOF
+$_thread
+EOF
+  fi
+}
+
 "$FFMPEG" -hide_banner -loglevel error -y \
   -f x11grab -draw_mouse 0 -video_size 1280x800 -i "${DISPLAY_NUM}.0" \
   -frames:v 1 -update 1 "$FULL"
+
+# win= only (no PNG): crop window.png from this same full grab.
+WIN_XYWH=""
+if [ -n "${REGIONS_PY}" ] && command -v python3 >/dev/null 2>&1; then
+  _geom="$(python3 "$REGIONS_PY" --window-geom 2>/dev/null || true)"
+  _win="$(printf '%s\n' "$_geom" | awk -F= '/^win=/{print $2; exit}')"
+  if printf '%s' "${_win:-}" | grep -Eq '^-?[0-9]+,-?[0-9]+,[1-9][0-9]*,[1-9][0-9]*$'; then
+    WIN_XYWH="$_win"
+  fi
+  unset _geom _win
+fi
+
+if [ -n "$WIN_XYWH" ]; then
+  IFS=',' read -r _wx _wy _ww _wh <<EOF
+$WIN_XYWH
+EOF
+  if [ "$_wx" = "0" ] && [ "$_wy" = "0" ] && [ "$_ww" = "1280" ] && [ "$_wh" = "800" ]; then
+    cp -f "$FULL" "$WINDOW_PNG" || true
+  else
+    "$FFMPEG" -hide_banner -loglevel error -y \
+      -i "$FULL" -filter:v "crop=${_ww}:${_wh}:${_wx}:${_wy}" "$WINDOW_PNG" || true
+  fi
+  unset _wx _wy _ww _wh
+fi
+
+# Reuse last list=/thread= when window.png hash and win= geom are unchanged.
+if [ -n "$WIN_XYWH" ] && [ -s "$WINDOW_PNG" ] && [ -n "${REGIONS_PY}" ] && command -v python3 >/dev/null 2>&1; then
+  _win_hash="$(sha256sum "$WINDOW_PNG" | awk '{print $1}')"
+  _cache_hit=0
+  if [ -f "$WINDOW_SHA" ] && [ -f "$WINDOW_BOXES" ]; then
+    _old_hash="$(tr -d '[:space:]' < "$WINDOW_SHA")"
+    _old_win="$(awk -F= '/^win=/{print $2; exit}' "$WINDOW_BOXES")"
+    if [ -n "$_win_hash" ] && [ "$_win_hash" = "$_old_hash" ] && [ "$WIN_XYWH" = "$_old_win" ]; then
+      _list="$(awk -F= '/^list=/{print $2; exit}' "$WINDOW_BOXES")"
+      _thread="$(awk -F= '/^thread=/{print $2; exit}' "$WINDOW_BOXES")"
+      apply_list_thread "${_list:-}" "${_thread:-}"
+      _cache_hit=1
+    fi
+  fi
+  if [ "$_cache_hit" -eq 0 ]; then
+    _geom="$(
+      python3 "$REGIONS_PY" --window-geom --window-png "$WINDOW_PNG" --ffmpeg "$FFMPEG" 2>/dev/null || true
+    )"
+    if [ -n "${_geom}" ]; then
+      _list="$(printf '%s\n' "$_geom" | awk -F= '/^list=/{print $2; exit}')"
+      _thread="$(printf '%s\n' "$_geom" | awk -F= '/^thread=/{print $2; exit}')"
+      apply_list_thread "${_list:-}" "${_thread:-}"
+      {
+        echo "win=$WIN_XYWH"
+        echo "list=${_list:-}"
+        echo "thread=${_thread:-}"
+      } > "$WINDOW_BOXES"
+      printf '%s\n' "$_win_hash" > "$WINDOW_SHA"
+    fi
+  fi
+  unset _win_hash _cache_hit _old_hash _old_win _list _thread _geom
+fi
 
 "$FFMPEG" -hide_banner -loglevel error -y \
   -i "$FULL" -filter:v "crop=${CROP_W}:${CROP_H}:${CROP_X}:${CROP_Y}" "$CROP"

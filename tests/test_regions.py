@@ -1335,8 +1335,24 @@ class WindowGeomTests(unittest.TestCase):
             thread = fh.read()
         self.assertIn("--window-geom", diff)
         self.assertIn("CROP_W=440", diff)
+        self.assertIn("--window-png", diff)
+        self.assertIn("window.png", diff)
+        self.assertTrue(
+            "window.sha256" in diff or "window.boxes" in diff,
+            "diff must persist window.sha256 or window.boxes",
+        )
         self.assertIn("--window-geom", thread)
         self.assertIn("THREAD_W=720", thread)
+        self.assertIn("--window-png", thread)
+        # Cheap UNCHANGED path must exit before any OCR helper is invoked.
+        unchanged_only = diff.split('if [ "$LIST_CHANGED" -eq 0 ]', 1)[1].split(
+            'echo "CHANGED"', 1
+        )[0]
+        self.assertIn('echo "UNCHANGED"', unchanged_only)
+        self.assertIn("exit 0", unchanged_only)
+        self.assertNotIn("emit_list_diff", unchanged_only)
+        self.assertNotIn("emit_full_list", unchanged_only)
+        self.assertNotIn("ocr", unchanged_only.lower())
 
 
 def write_three_pane_png(
@@ -1416,6 +1432,32 @@ class PaneDetectTests(unittest.TestCase):
             crops = regions.window_crops(0, 0, 1280, 800, rgb=rgb, frame_w=w, frame_h=h)
             self.assertTrue(_box_contains(crops["list"], 180, 100), crops)
             self.assertFalse(_box_contains(crops["thread"], 180, 100), crops)
+
+    def test_gutter_move_updates_list_x(self):
+        """Two synthetic windows: dragged splitter must move list x / list_x."""
+        self.assertTrue(os.path.isfile(PERSIST_FFMPEG), "persist ffmpeg missing")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-pane-move-") as td:
+            a = os.path.join(td, "a.png")
+            b = os.path.join(td, "b.png")
+            write_three_pane_png(
+                a, 900, 600, gutter1=49, gutter2=250,
+                header_h=24, footer_h=60,
+            )
+            write_three_pane_png(
+                b, 900, 600, gutter1=120, gutter2=400,
+                header_h=24, footer_h=60,
+            )
+            rgb_a, wa, ha = _decode_png(a)
+            rgb_b, wb, hb = _decode_png(b)
+            pa = regions.detect_panes(rgb_a, wa, ha)
+            pb = regions.detect_panes(rgb_b, wb, hb)
+            self.assertIsNotNone(pa, "expected gutters on gutter2=250")
+            self.assertIsNotNone(pb, "expected gutters on gutter2=400")
+            ca = regions.window_crops(0, 0, 900, 600, rgb=rgb_a, frame_w=wa, frame_h=ha)
+            cb = regions.window_crops(0, 0, 900, 600, rgb=rgb_b, frame_w=wb, frame_h=hb)
+            self.assertNotEqual(pa["list_x"], pb["list_x"], (pa, pb))
+            self.assertNotEqual(ca["list"][0], cb["list"][0], (ca, cb))
+            self.assertNotEqual(pa["thread_x"], pb["thread_x"], (pa, pb))
 
     def test_900x600_different_gutters(self):
         with tempfile.TemporaryDirectory(prefix="wechat-watch-pane-b-") as td:
