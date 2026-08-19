@@ -21,12 +21,14 @@ Usage:
       --identities identities.json --avatars-dir avatars/
   wechat-watch-regions --format-time [--when ISO8601]
   wechat-watch-regions --ocr-still THREAD.png [--json OUT.json] [--when ISO8601]
+  wechat-watch-regions --detect-unread LIST.png   # red badge / dot / [N条] (read-only)
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -65,6 +67,25 @@ IDENTITIES_VERSION = 1
 # 1280x800 WeChat 4.1 geometry (w, h, x, y). List hash + thread scroll use these.
 LIST_CROP = (440, 700, 70, 30)
 THREAD_CROP = (720, 660, 414, 40)
+FULL_DESKTOP = (1280, 800)
+
+# Left-list unread markers (WeChat 4.1 red badge / muted dot / [N条]).
+RED_R_MIN = 200
+RED_G_MAX = 120
+RED_B_MAX = 120
+RED_CHROMA = 70
+UNREAD_MIN_SIDE = 5
+UNREAD_MAX_SIDE = 36
+UNREAD_MIN_PIXELS = 12
+UNREAD_ASPECT_MIN = 0.55
+UNREAD_FILL_MIN = 0.28
+UNREAD_FILL_MAX = 0.95
+UNREAD_MERGE_GAP = 3
+UNREAD_ROW_H = 70
+UNREAD_BADGE_OCR_SIDE = 160
+UNREAD_BADGE_PAD = 3
+TIAO_RE = re.compile(r"\[(\d+)\s*条\]")
+Z_MARK_RE = re.compile(r"(?<![A-Za-z0-9])([zZ])(?![A-Za-z0-9])")
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 # CJK Unified Ideographs + common extensions / compatibility (not punctuation).
@@ -1181,6 +1202,388 @@ def ocr_thread_still(
     return recs
 
 
+def is_wechat_red(r: int, g: int, b: int) -> bool:
+    """Bright WeChat badge red: high R, much lower G/B."""
+    return (
+        r >= RED_R_MIN
+        and g <= RED_G_MAX
+        and b <= RED_B_MAX
+        and (r - g) >= RED_CHROMA
+        and (r - b) >= RED_CHROMA
+    )
+
+
+def red_mask(rgb: bytes, w: int, h: int) -> bytearray:
+    n = w * h
+    mask = bytearray(n)
+    for i in range(n):
+        o = i * 3
+        if is_wechat_red(rgb[o], rgb[o + 1], rgb[o + 2]):
+            mask[i] = 1
+    return mask
+
+
+def mask_pixels(mask: bytearray, box: tuple[int, int, int, int], w: int, h: int) -> int:
+    x, y, bw, bh = box
+    n = 0
+    x2 = min(w, x + bw)
+    y2 = min(h, y + bh)
+    x0 = max(0, x)
+    y0 = max(0, y)
+    for yy in range(y0, y2):
+        row = yy * w
+        for xx in range(x0, x2):
+            if mask[row + xx]:
+                n += 1
+    return n
+
+
+def is_circular_badge(
+    box: tuple[int, int, int, int], npix: int
+) -> bool:
+    _x, _y, bw, bh = box
+    if bw < UNREAD_MIN_SIDE or bh < UNREAD_MIN_SIDE:
+        return False
+    if bw > UNREAD_MAX_SIDE or bh > UNREAD_MAX_SIDE:
+        return False
+    if npix < UNREAD_MIN_PIXELS:
+        return False
+    longer = max(bw, bh)
+    shorter = min(bw, bh)
+    if longer <= 0 or shorter / longer < UNREAD_ASPECT_MIN:
+        return False
+    fill = npix / float(bw * bh)
+    return UNREAD_FILL_MIN <= fill <= UNREAD_FILL_MAX
+
+
+def red_clusters(
+    rgb: bytes, w: int, h: int
+) -> list[tuple[int, int, int, int, int]]:
+    """Denoised 8-connected bright-red blobs → (x, y, w, h, pixels)."""
+    mask = denoise(red_mask(rgb, w, h), w, h)
+    boxes = merge_boxes(components(mask, w, h), UNREAD_MERGE_GAP)
+    out: list[tuple[int, int, int, int, int]] = []
+    for box in boxes:
+        n = mask_pixels(mask, box, w, h)
+        if is_circular_badge(box, n):
+            x, y, bw, bh = box
+            out.append((x, y, bw, bh, n))
+    return out
+
+
+def unread_source_box(w: int, h: int) -> tuple[int, int, int, int] | None:
+    """Crop LIST_CROP out of a 1280x800 desktop shot. Else use the whole PNG."""
+    lw, lh, lx, ly = LIST_CROP
+    if (w, h) == FULL_DESKTOP:
+        return (lx, ly, lw, lh)
+    return None
+
+
+def run_tesseract(
+    path: str,
+    psm: int,
+    lang: str = "eng",
+    whitelist: str | None = None,
+) -> str:
+    tess = find_tesseract()
+    data_dir = tessdata_dir()
+    env = os.environ.copy()
+    env["TESSDATA_PREFIX"] = data_dir
+    cmd = [
+        tess,
+        path,
+        "stdout",
+        "-l",
+        lang,
+        "--psm",
+        str(psm),
+        "--tessdata-dir",
+        data_dir,
+    ]
+    if whitelist:
+        cmd.extend(("-c", f"tessedit_char_whitelist={whitelist}"))
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=OCR_TIMEOUT,
+        )
+        return proc.stdout or ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def parse_digit_count(raw: str) -> int:
+    m = re.search(r"\d+", raw or "")
+    if not m:
+        return 0
+    try:
+        return int(m.group(0))
+    except ValueError:
+        return 0
+
+
+def ocr_badge_count(
+    ffmpeg: str,
+    src: str,
+    box: tuple[int, int, int, int],
+    frame_w: int,
+    frame_h: int,
+    td: str,
+) -> int:
+    """Scale a small red badge and OCR digits (bypass classify_ocr; 1 digit is OK)."""
+    x, y, bw, bh = pad_box(box, frame_w, frame_h, UNREAD_BADGE_PAD)
+    if bw < 1 or bh < 1:
+        return 0
+    crop = os.path.join(td, "badge.png")
+    scaled = os.path.join(td, "badge-scaled.png")
+    try:
+        crop_png(ffmpeg, src, crop, (x, y, bw, bh))
+    except (OSError, subprocess.CalledProcessError):
+        return 0
+    factor = max(2, (UNREAD_BADGE_OCR_SIDE + min(bw, bh) - 1) // max(1, min(bw, bh)))
+    vf = f"scale=iw*{factor}:ih*{factor}:flags=neighbor"
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        crop,
+        "-filter:v",
+        vf,
+        scaled,
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        scaled = crop
+    # psm 8/13 often read a white digit on a small red disc; 10/7 can return empty.
+    for psm in (8, 13, 10, 7):
+        raw = run_tesseract(scaled, psm, lang="eng", whitelist="0123456789")
+        n = parse_digit_count(raw)
+        if n:
+            return n
+        raw = run_tesseract(scaled, psm, lang="eng")
+        n = parse_digit_count(raw)
+        if n:
+            return n
+    return 0
+
+
+def parse_text_marks(text: str) -> list[dict]:
+    """[N条], @ mention, standalone z/Z. Do not invent other marks."""
+    marks: list[dict] = []
+    raw = text or ""
+    for m in TIAO_RE.finditer(raw):
+        marks.append({"kind": "text", "count": int(m.group(1)), "label": m.group(0)})
+    if "@" in raw:
+        marks.append({"kind": "text", "count": 0, "label": "@"})
+    for m in Z_MARK_RE.finditer(raw):
+        marks.append({"kind": "text", "count": 0, "label": m.group(1)})
+    return marks
+
+
+def unread_row_bands(h: int, row_h: int = UNREAD_ROW_H) -> list[tuple[int, int]]:
+    """(y, height) strips covering the list, including y=0 (search + first row)."""
+    if h <= 0:
+        return []
+    if h <= row_h + 16:
+        return [(0, h)]
+    bands: list[tuple[int, int]] = []
+    y = 0
+    while y < h:
+        bands.append((y, min(row_h, h - y)))
+        y += row_h
+    return bands
+
+
+def parse_row_title(raw: str) -> str:
+    if not raw:
+        return ""
+    line = raw.strip().splitlines()[0].strip()
+    line = re.sub(r"\s+\d{1,2}:\d{2}\s*$", "", line)
+    kind, text = classify_ocr(line)
+    if kind == "text":
+        return text[:NICK_MAX_CHARS]
+    return ""
+
+
+def ocr_row_title(
+    ffmpeg: str,
+    src: str,
+    box: tuple[int, int, int, int],
+    frame_w: int,
+    frame_h: int,
+    td: str,
+    idx: int,
+) -> str:
+    x, y, bw, bh = box
+    nx = min(frame_w - 1, x + bw + 8)
+    ny = max(0, y - 6)
+    nw = max(1, min(220, frame_w - nx))
+    nh = max(1, min(36, frame_h - ny))
+    dest = os.path.join(td, f"title{idx}.png")
+    try:
+        crop_png(ffmpeg, src, dest, (nx, ny, nw, nh))
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    text, _kind = ocr_png(dest, (nx, ny, nw, nh))
+    return parse_row_title(text)
+
+
+def _unread_rec(
+    kind: str,
+    count: int,
+    label: str,
+    box: tuple[int, int, int, int],
+    name: str = "",
+) -> dict:
+    x, y, bw, bh = box
+    return {
+        "kind": kind,
+        "count": int(count or 0),
+        "label": label or "",
+        "x": int(x),
+        "y": int(y),
+        "w": int(bw),
+        "h": int(bh),
+        "name": name or "",
+    }
+
+
+def merge_unread_rows(recs: list[dict], row_h: int = UNREAD_ROW_H) -> list[dict]:
+    """One record per chat row. Prefer number > dot > text; keep [N条]/@ /z labels."""
+    if not recs:
+        return []
+    ordered = sorted(recs, key=lambda r: (r["y"], r["x"]))
+    groups: list[list[dict]] = []
+    for rec in ordered:
+        cy = rec["y"] + rec["h"] / 2.0
+        placed = False
+        # Full-frame text boxes (no tight crop) do not swallow other rows.
+        if rec["h"] <= row_h * 2:
+            for g in groups:
+                if g[0]["h"] > row_h * 2:
+                    continue
+                gy = g[0]["y"] + g[0]["h"] / 2.0
+                if abs(cy - gy) <= row_h * 0.5:
+                    g.append(rec)
+                    placed = True
+                    break
+        if not placed:
+            groups.append([rec])
+    rank = {"number": 0, "dot": 1, "text": 2}
+    out: list[dict] = []
+    for g in groups:
+        g.sort(key=lambda r: rank.get(r["kind"], 9))
+        base = dict(g[0])
+        for extra in g[1:]:
+            if extra["count"] and not base["count"]:
+                base["count"] = extra["count"]
+            elabel = extra.get("label") or ""
+            if extra["kind"] == "text" and elabel:
+                blabel = base.get("label") or ""
+                if not blabel or blabel.isdigit():
+                    base["label"] = elabel
+                elif elabel not in blabel:
+                    base["label"] = f"{blabel} {elabel}"
+            if extra.get("name") and not base.get("name"):
+                base["name"] = extra["name"]
+            x1 = min(base["x"], extra["x"])
+            y1 = min(base["y"], extra["y"])
+            x2 = max(base["x"] + base["w"], extra["x"] + extra["w"])
+            y2 = max(base["y"] + base["h"], extra["y"] + extra["h"])
+            base["x"], base["y"], base["w"], base["h"] = x1, y1, x2 - x1, y2 - y1
+        if base["kind"] == "number" and base["count"] and not base["label"]:
+            base["label"] = str(base["count"])
+        out.append(base)
+    out.sort(key=lambda r: (r["y"], r["x"]))
+    return out
+
+
+def detect_unread(path: str, ffmpeg: str) -> list[dict]:
+    """Read-only: red number / red dot / [N条] / @ / z on the left chat list."""
+    w, h = png_size(path)
+    recs: list[dict] = []
+    with tempfile.TemporaryDirectory(prefix="wechat-watch-unread-") as td:
+        src = path
+        crop_box = unread_source_box(w, h)
+        if crop_box is not None:
+            src = os.path.join(td, "list-crop.png")
+            crop_png(ffmpeg, path, src, crop_box)
+            w, h = crop_box[2], crop_box[3]
+        rgb = decode_rgb24(ffmpeg, src, w, h, os.path.join(td, "list.rgb"))
+        for i, (x, y, bw, bh, _n) in enumerate(red_clusters(rgb, w, h)):
+            box = (x, y, bw, bh)
+            count = ocr_badge_count(ffmpeg, src, box, w, h, td)
+            kind = "number" if count > 0 else "dot"
+            label = str(count) if count else ""
+            recs.append(_unread_rec(kind, count, label, box))
+        full_text, _kind = ocr_png(src, (0, 0, w, h))
+        marks = parse_text_marks(full_text)
+        if marks:
+            located = False
+            for bi, (y, bh) in enumerate(unread_row_bands(h)):
+                dest = os.path.join(td, f"band{bi}.png")
+                try:
+                    crop_png(ffmpeg, src, dest, (0, y, w, bh))
+                except (OSError, subprocess.CalledProcessError):
+                    continue
+                band_text, _k = ocr_png(dest, (0, y, w, bh))
+                for mark in parse_text_marks(band_text):
+                    recs.append(
+                        _unread_rec(
+                            "text",
+                            mark["count"],
+                            mark["label"],
+                            (0, y, w, bh),
+                        )
+                    )
+                    located = True
+            if not located:
+                for mark in marks:
+                    recs.append(
+                        _unread_rec(
+                            "text",
+                            mark["count"],
+                            mark["label"],
+                            (0, 0, w, h),
+                        )
+                    )
+        recs = merge_unread_rows(recs)
+        for i, rec in enumerate(recs):
+            if rec.get("name"):
+                continue
+            rec["name"] = ocr_row_title(
+                ffmpeg,
+                src,
+                (rec["x"], rec["y"], rec["w"], rec["h"]),
+                w,
+                h,
+                td,
+                i,
+            )
+    return recs
+
+
+def emit_unread_stdout(recs: list[dict]) -> None:
+    print(f"unread_rows={len(recs)}")
+    for i, rec in enumerate(recs):
+        print(f"unread{i}_kind={rec.get('kind', '')}")
+        print(f"unread{i}_count={int(rec.get('count') or 0)}")
+        print(f"unread{i}_label={rec.get('label') or ''}")
+        print(f"unread{i}_x={int(rec.get('x') or 0)}")
+        print(f"unread{i}_y={int(rec.get('y') or 0)}")
+        print(f"unread{i}_w={int(rec.get('w') or 0)}")
+        print(f"unread{i}_h={int(rec.get('h') or 0)}")
+        print(f"unread{i}_name={rec.get('name') or ''}")
+
+
 def default_ffmpeg() -> str:
     return os.environ.get(
         "WECHAT_FFMPEG",
@@ -1277,6 +1680,11 @@ def main() -> int:
         "--ocr-still",
         help="OCR one thread-pane PNG and print text for wechat-group-summaries",
     )
+    p.add_argument(
+        "--detect-unread",
+        metavar="LIST.png",
+        help="read-only: red badge / red dot / [N条] / @ / z on the left chat list",
+    )
     args = p.parse_args()
 
     if args.format_time:
@@ -1288,6 +1696,15 @@ def main() -> int:
             print(f"ERROR: thread png missing: {args.ocr_still}", file=sys.stderr)
             return 2
         ocr_thread_still(args.ocr_still, json_path=args.json, when=parse_when(args.when))
+        return 0
+
+    if args.detect_unread:
+        if not os.path.isfile(args.detect_unread):
+            print(f"ERROR: list png missing: {args.detect_unread}", file=sys.stderr)
+            return 2
+        ffmpeg = resolve_ffmpeg(args.ffmpeg)
+        recs = detect_unread(args.detect_unread, ffmpeg)
+        emit_unread_stdout(recs)
         return 0
 
     if args.should_record:
@@ -1354,7 +1771,7 @@ def main() -> int:
         return 0
 
     if not args.prev or not args.curr:
-        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still")
+        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread")
     if not args.out_dir or not args.json:
         p.error("--out-dir and --json are required unless --detect-scroll / --parse-frames / --should-record")
 

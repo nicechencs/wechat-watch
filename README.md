@@ -171,6 +171,9 @@ kind1=image
 # 当前右侧对话区只读 OCR（给 wechat-group-summaries，不发送）
 ./wechat-watch-thread
 ./wechat-watch-regions --format-time --when 2026-08-19T07:02:00+00:00
+
+# 列表未读标记（只读，不点击）：哪一行有红数字 / 红点 / [N条]
+./wechat-watch-regions --detect-unread "$WECHAT_PERSIST/watch/list.png"
 ```
 
 ## 区域差分规则
@@ -182,6 +185,36 @@ kind1=image
 5. 间距 `≤ 16px` 的框合并，再向外垫 `8px`
 6. 小于 `20×20` 的框丢掉；左侧 `80px` 内、不小于 `12×12` 的当作红点徽章保留
 7. 最多 6 个框；变化面积超过裁剪区 `40%`（滚动、整页刷新）则退回整块列表
+
+差分只保留左侧小变化框（`is_badge` / `BADGE_LEFT=80`），**不会**扫红像素，也**不会**给出未读条数。要知道「哪一行未读」，用下面的 `--detect-unread`。
+
+## 未读标记（哪一行有红数字 / 红点 / [N条]）
+
+列表哈希仍是廉价信号：没变就是 `UNCHANGED`，到此结束。`--detect-unread` 是只读的第二步，用来指出**哪一行**有未读标记：
+
+- 头像右上角的鲜红圆标 + 白色数字（例如「5」）→ `kind=number`，`count` 为 OCR 到的数字
+- 很小的红点（免打扰 / 不显示条数）→ `kind=dot`
+- 预览里的 `[3条]` / `[12条]`、`@`、以及单独出现的 `z`/`Z` → `kind=text`
+
+```
+./wechat-watch-regions --detect-unread list.png
+```
+
+`list.png` 可以是已经裁好的 `440x700` 列表，也可以是整屏 `1280x800`（会先按 `LIST_CROP 440x700+70+30` 裁左侧）。输出例如：
+
+```
+unread_rows=1
+unread0_kind=number
+unread0_count=5
+unread0_label=[5条]
+unread0_x=166
+unread0_y=54
+unread0_w=14
+unread0_h=14
+unread0_name=独立产品创业
+```
+
+不点击、不打字、不发送。列表预览仍然**不是**群记录；群内容以右侧对话区为准（见 [docs/group-handling.md](docs/group-handling.md)）。
 
 ## OCR 规则
 
@@ -199,7 +232,7 @@ kind1=image
 python3 tests/test_regions.py
 ```
 
-当前覆盖：假色块切框、徽章保留、大面积变化回退、中英 OCR、CLI 的 `textN=` / `kindN=`、thread 尺寸切框、左右气泡 → `in`/`out`、滚动检测、列表变化不录像、头像 average-hash、identities 绑定、时间线 JSON、`wechat-watch-gc` 过期删除、UTC/Asia/Shanghai 双时区、`wechat-watch-thread --png` 只读 OCR。
+当前覆盖：假色块切框、徽章保留、大面积变化回退、中英 OCR、CLI 的 `textN=` / `kindN=`、thread 尺寸切框、左右气泡 → `in`/`out`、滚动检测、列表变化不录像、头像 average-hash、identities 绑定、时间线 JSON、`wechat-watch-gc` 过期删除、UTC/Asia/Shanghai 双时区、`wechat-watch-thread --png` 只读 OCR、左侧未读标记（红数字 / 红点 / `[N条]`）。
 
 ## 运行时文件（不进 git）
 
@@ -232,7 +265,7 @@ wechat-watch/
 ├── CONTRIBUTING.md         贡献说明
 ├── docs/group-handling.md  群聊处理办法（信号 / 右侧翻历史 / 不发言 / 摘要仓库）
 ├── wechat-watch-diff       Bash 入口：列表哈希、滚动才录像、GC
-├── wechat-watch-regions    Python：差分切框 + OCR + 滚动检测 + 时间线 + 双时区
+├── wechat-watch-regions    Python：差分切框 + OCR + 滚动检测 + 时间线 + 双时区 + 未读标记
 ├── wechat-watch-thread     只读：裁右侧对话区并 OCR，打印文本给 summaries
 ├── wechat-watch-gc         过期删除录像/截图，只留识别结果
 └── tests/test_regions.py   单元测试
@@ -244,7 +277,7 @@ wechat-watch/
 
 左侧会话列表每一行预览都很短，群聊里「谁说了什么」单靠列表看不清。翻历史时以右侧对话区为准：
 
-- 未读轮询仍然只看左侧列表哈希，列表没变就是 `UNCHANGED`
+- 未读轮询仍然只看左侧列表哈希，列表没变就是 `UNCHANGED`。`--detect-unread` 只回答「哪一行有红数字 / 红点 / [N条]」，列表预览仍不是群记录
 - **翻历史、有滚动条才录屏**：只录对话区矩形，逐帧切气泡，`side=in|out`
 - 群聊昵称一般在气泡上方；解析时会向上多留约 22px，OCR 进时间线的 `name`
 - 对方头像 average-hash 后和昵称绑在 `identities.json`，下次同一头像即使 OCR 失败也能补上名字

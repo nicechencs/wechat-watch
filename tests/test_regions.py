@@ -937,6 +937,169 @@ class ThreadHelperTests(unittest.TestCase):
         with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
             readme = fh.read()
         self.assertIn("docs/group-handling.md", readme)
+        self.assertIn("--detect-unread", readme)
+        self.assertIn("[N条]", doc)
+        self.assertIn("--detect-unread", doc)
+
+
+def _parse_unread_stdout(stdout: str) -> dict:
+    rec = {}
+    for ln in stdout.splitlines():
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            rec[k] = v
+    return rec
+
+
+def write_red_circle_png(
+    path: str,
+    w: int,
+    h: int,
+    cx: int,
+    cy: int,
+    radius: int,
+    digit: str | None = None,
+    fontsize: int = 16,
+) -> None:
+    """Synthetic WeChat badge or muted dot via ffmpeg geq (+ optional white digit)."""
+    ffmpeg = SYSTEM_FFMPEG if os.path.isfile(SYSTEM_FFMPEG) else "ffmpeg"
+    geq = (
+        f"geq=r='if(lt(hypot(X-{cx},Y-{cy}),{radius}),250,255)':"
+        f"g='if(lt(hypot(X-{cx},Y-{cy}),{radius}),81,255)':"
+        f"b='if(lt(hypot(X-{cx},Y-{cy}),{radius}),81,255)'"
+    )
+    vf = geq
+    if digit:
+        font = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        # Center the digit roughly inside the circle.
+        tx = max(0, cx - fontsize // 3)
+        ty = max(0, cy - fontsize // 2)
+        vf = (
+            f"{geq},drawtext=fontfile={font}:text='{digit}':"
+            f"fontcolor=white:fontsize={fontsize}:x={tx}:y={ty}"
+        )
+    run_ffmpeg(
+        ffmpeg,
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=white:s={w}x{h}",
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            "-vf",
+            vf,
+            path,
+        ],
+    )
+
+
+class UnreadMarkerTests(unittest.TestCase):
+    """Left-list unread: red number badge, muted red dot, [N条] text."""
+
+    def test_wechat_red_and_not_avatar_pink(self):
+        self.assertTrue(regions.is_wechat_red(250, 81, 81))
+        self.assertTrue(regions.is_wechat_red(255, 0, 0))
+        self.assertFalse(regions.is_wechat_red(255, 255, 255))
+        self.assertFalse(regions.is_wechat_red(80, 80, 80))
+        # Skin / warm avatar: not badge-red.
+        self.assertFalse(regions.is_wechat_red(220, 160, 140))
+
+    def test_parse_text_marks_tiao_at_z(self):
+        marks = regions.parse_text_marks("ragnarok: [3条] hello @me")
+        labels = [m["label"] for m in marks]
+        self.assertIn("[3条]", labels)
+        self.assertIn("@", labels)
+        tiao = next(m for m in marks if m["label"] == "[3条]")
+        self.assertEqual(tiao["count"], 3)
+        self.assertEqual(tiao["kind"], "text")
+        zmarks = regions.parse_text_marks("preview z end")
+        self.assertEqual([m["label"] for m in zmarks], ["z"])
+        zm2 = regions.parse_text_marks("Z")
+        self.assertEqual([m["label"] for m in zm2], ["Z"])
+        # Do not invent marks; do not treat z inside a Latin word.
+        self.assertEqual(regions.parse_text_marks("Zoom soze 你好"), [])
+        self.assertEqual(regions.parse_text_marks("[Photo] [Link]"), [])
+        twelve = regions.parse_text_marks("[12条]")
+        self.assertEqual(twelve[0]["count"], 12)
+
+    def test_unread_source_box_full_desktop(self):
+        self.assertEqual(regions.unread_source_box(1280, 800), (70, 30, 440, 700))
+        self.assertIsNone(regions.unread_source_box(440, 700))
+        self.assertIsNone(regions.unread_source_box(200, 100))
+
+    def test_red_circle_digit_is_number(self):
+        self.assertTrue(os.path.isfile(SYSTEM_FFMPEG), "system ffmpeg missing")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-unread-n-") as td:
+            png = os.path.join(td, "badge.png")
+            write_red_circle_png(png, 200, 100, cx=40, cy=36, radius=12, digit="5", fontsize=16)
+            recs = regions.detect_unread(png, PERSIST_FFMPEG)
+            kinds = [r["kind"] for r in recs]
+            self.assertIn("number", kinds, recs)
+            num = next(r for r in recs if r["kind"] == "number")
+            self.assertEqual(num["count"], 5)
+            self.assertGreater(num["w"], 0)
+            self.assertGreater(num["h"], 0)
+
+    def test_small_red_dot_is_dot(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-unread-d-") as td:
+            png = os.path.join(td, "dot.png")
+            write_red_circle_png(png, 120, 80, cx=40, cy=40, radius=4, digit=None)
+            recs = regions.detect_unread(png, PERSIST_FFMPEG)
+            self.assertTrue(recs, "expected a red-dot unread")
+            self.assertEqual(recs[0]["kind"], "dot")
+            self.assertEqual(recs[0]["count"], 0)
+
+    def test_tiao_preview_is_text(self):
+        self.assertTrue(os.path.isfile(CJK_FONT), "missing CJK font")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-unread-t-") as td:
+            png = os.path.join(td, "tiao.png")
+            write_text_png(png, "[3条]")
+            recs = regions.detect_unread(png, PERSIST_FFMPEG)
+            self.assertTrue(recs, "expected [3条] text unread")
+            text_recs = [r for r in recs if r["kind"] == "text"]
+            self.assertTrue(text_recs, recs)
+            self.assertEqual(text_recs[0]["count"], 3)
+            self.assertIn("3", text_recs[0]["label"])
+            self.assertIn("条", text_recs[0]["label"])
+
+    def test_cli_detect_unread_number(self):
+        self.assertTrue(os.path.isfile(SYSTEM_FFMPEG), "system ffmpeg missing")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-unread-cli-") as td:
+            png = os.path.join(td, "badge.png")
+            write_red_circle_png(png, 200, 100, cx=40, cy=36, radius=12, digit="5", fontsize=16)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "--detect-unread",
+                    png,
+                    "--ffmpeg",
+                    PERSIST_FFMPEG,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            parsed = _parse_unread_stdout(proc.stdout)
+            self.assertIn("unread_rows", parsed, proc.stdout)
+            self.assertGreaterEqual(int(parsed["unread_rows"]), 1, proc.stdout)
+            self.assertEqual(parsed.get("unread0_kind"), "number", proc.stdout)
+            self.assertEqual(parsed.get("unread0_count"), "5", proc.stdout)
+            self.assertIn("unread0_x", parsed)
+            self.assertIn("unread0_y", parsed)
+            self.assertIn("unread0_w", parsed)
+            self.assertIn("unread0_h", parsed)
+            self.assertIn("unread0_name", parsed)
+
+    def test_blank_list_has_no_unread(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-unread-b-") as td:
+            png = os.path.join(td, "blank.png")
+            write_solid_png(png, 200, 100, "white")
+            recs = regions.detect_unread(png, PERSIST_FFMPEG)
+            self.assertEqual(recs, [])
 
 
 if __name__ == "__main__":

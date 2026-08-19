@@ -26,7 +26,7 @@
 
 | 区域 | 几何（宽x高+左+上） | 谁用 | 作用 |
 |---|---|---|---|
-| 左侧会话列表 | `440x700+70+30`（ffmpeg `crop=440:700:70:30`） | `wechat-watch-diff` 哈希 | **廉价未读信号**。没变 → `UNCHANGED`，零 OCR。变了 → 列表小块 OCR，**到此为止，不当群记录** |
+| 左侧会话列表 | `440x700+70+30`（ffmpeg `crop=440:700:70:30`） | `wechat-watch-diff` 哈希；`--detect-unread` | **廉价未读信号**。没变 → `UNCHANGED`，零 OCR。变了 → 列表小块 OCR；若要知道哪一行有红数字 / 红点 / `[N条]`，再跑 `--detect-unread`。**到此为止，不当群记录** |
 | 右侧对话区 | `720x660+414+40`（ffmpeg `crop=720:660:414:40`） | 滚动检测、短录像、`wechat-watch-thread` | **唯一的群内容来源**。下沿停在输入框之上，避免光标和 dock |
 
 流程可以记成：
@@ -49,7 +49,7 @@
 ### 各脚本
 
 - **`wechat-watch-diff`**：只哈希左侧列表。列表变化**不会**开始录像。录像只在右侧对话区判定为滚动时启动。
-- **`wechat-watch-regions`**：区域差分 + `chi_sim+eng` OCR；`--detect-scroll`；`--parse-frames` 写出 `{t,side,name,avatar_hash,text}`；`--ocr-still` 识别一张已裁好的对话区；`--format-time` 打出 UTC / Asia/Shanghai。群聊气泡上方昵称用 `--extra-top-pad 22`，左右气泡用 `--emit-side`（`in` / `out`）。
+- **`wechat-watch-regions`**：区域差分 + `chi_sim+eng` OCR；`--detect-scroll`；`--parse-frames` 写出 `{t,side,name,avatar_hash,text}`；`--ocr-still` 识别一张已裁好的对话区；`--format-time` 打出 UTC / Asia/Shanghai；`--detect-unread LIST.png` 扫左侧列表的鲜红圆标 / 红点 / `[N条]` / `@` / 单独的 `z`（只读，不点击）。群聊气泡上方昵称用 `--extra-top-pad 22`，左右气泡用 `--emit-side`（`in` / `out`）。列表哈希仍是廉价信号；`--detect-unread` 只告诉你哪一行有未读标记，列表预览仍然不是群记录。
 - **`wechat-watch-thread`**：只读助手。对当前 `DISPLAY`（默认 `:8`）截屏，裁右侧 `720x660+414+40`，调用 `--ocr-still`，把 `thread_textN=` 打到 stdout，供 agent 写进 summaries。可用 `--png` 识别已有图（整屏会先裁对话区）。**不点击、不打字、不发送。**
 - **身份表**：对方头像 average-hash 写入 `persist/watch/identities.json`（名字↔哈希）。下次同一头像即使 OCR 失败也能补昵称。
 - **`wechat-watch-gc`**：解析完成后删录像和抽帧；`regions` / `thread-regions` 小块 15 分钟过期；头像 7 天；`list.png` / `thread.png` / `identities.json` 保留。每次 diff / thread 跑完会带一次 GC。
@@ -59,7 +59,7 @@
 ## 推荐操作顺序
 
 1. 跑 `./wechat-watch-diff`。`UNCHANGED` 且无 `scroll=1` → 停，不要读图。
-2. `CHANGED` → 只把列表 OCR 当作「哪个群可能有新消息」，**不要**据此写摘要。
+2. `CHANGED` → 只把列表 OCR 当作「哪个群可能有新消息」，**不要**据此写摘要。需要定位行时再跑 `--detect-unread`（红数字 / 红点 / `[N条]`）；列表预览仍然不是群记录。
 3. 在桌面上**点进**该群（人手或桌面操作；本仓库不提供「点群 / 发消息」自动化）。
 4. 只在右侧对话区往上翻最近历史。不要点输入框，不要回复，包括「独立产品创业联盟3群」。
 5. 跑 `./wechat-watch-thread`（或等 diff 在滚动时写出 `timeline=`）。
@@ -90,4 +90,7 @@ export DISPLAY="${DISPLAY:-:8}"
 
 # 已有对话区 PNG
 ./wechat-watch-regions --ocr-still thread.png --json /tmp/thread.json
+
+# 哪一行有红数字 / 红点 / [N条]（只读；列表预览仍不是群记录）
+./wechat-watch-regions --detect-unread "$WECHAT_PERSIST/watch/list.png"
 ```
