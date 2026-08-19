@@ -189,6 +189,10 @@ fi
 WECHAT_FFMPEG="$FFMPEG" python3 "$REGIONS_PY" \
   --ocr-still "$THREAD_READ" \
   --json "$JSON" \
+  --prefix t \
+  --label thread_ \
+  --emit-side \
+  --extra-top-pad 22 \
   "${TIME_ARGS[@]}"
 
 run_gc
