@@ -1,0 +1,131 @@
+#!/bin/bash
+# Cheap WeChat change detector: capture screen, crop chat list, compare hash.
+# Prints UNCHANGED or CHANGED. Never sends the image to a model.
+# Crop excludes the right compose pane (blinking cursor) and the dock.
+# On CHANGED, also write region crops of rectangles that actually differ.
+set -euo pipefail
+
+DISPLAY_NUM="${DISPLAY:-:8}"
+PERSIST="/home/box/.local/share/wechat-persist"
+STATE_DIR="$PERSIST/watch"
+FULL="$STATE_DIR/full.png"
+CROP="$STATE_DIR/list.png"
+PREV="$STATE_DIR/list.prev.png"
+PREV_HASH_FILE="$STATE_DIR/list.sha256"
+REGIONS_DIR="$STATE_DIR/regions"
+REGIONS_JSON="$STATE_DIR/regions.json"
+PERSIST_FFMPEG="$PERSIST/bin/ffmpeg"
+# Prefer the git-repo helper; fall back to persist copy.
+REGIONS_PY=""
+for cand in \
+  "/home/box/wechat-watch/wechat-watch-regions" \
+  "$PERSIST/wechat-watch-regions"
+do
+  if [ -f "$cand" ]; then
+    REGIONS_PY="$cand"
+    break
+  fi
+done
+CROP_W=440
+CROP_H=700
+CROP_X=70
+CROP_Y=30
+
+mkdir -p "$STATE_DIR"
+
+find_ffmpeg() {
+  if [ -x "$PERSIST_FFMPEG" ]; then
+    printf '%s\n' "$PERSIST_FFMPEG"
+    return 0
+  fi
+  if command -v ffmpeg >/dev/null 2>&1; then
+    command -v ffmpeg
+    return 0
+  fi
+  return 1
+}
+
+FFMPEG=""
+if ! FFMPEG=$(find_ffmpeg); then
+  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg || true
+  if ! FFMPEG=$(find_ffmpeg); then
+    echo "ERROR: ffmpeg missing (no persist/bin/ffmpeg, no PATH ffmpeg, apt install failed)" >&2
+    exit 1
+  fi
+fi
+
+# Keep previous crop before replacing list.png.
+if [ -f "$CROP" ]; then
+  cp -f "$CROP" "$PREV"
+fi
+HAD_PREV=0
+if [ -f "$PREV" ]; then
+  HAD_PREV=1
+fi
+
+"$FFMPEG" -hide_banner -loglevel error -y \
+  -f x11grab -draw_mouse 0 -video_size 1280x800 -i "${DISPLAY_NUM}.0" \
+  -frames:v 1 -update 1 "$FULL"
+
+"$FFMPEG" -hide_banner -loglevel error -y \
+  -i "$FULL" -filter:v "crop=${CROP_W}:${CROP_H}:${CROP_X}:${CROP_Y}" "$CROP"
+
+HASH=$(sha256sum "$CROP" | awk '{print $1}')
+NOW=$(date -Is)
+
+if [ -f "$PREV_HASH_FILE" ]; then
+  OLD=$(cat "$PREV_HASH_FILE")
+  if [ "$HASH" = "$OLD" ]; then
+    echo "UNCHANGED"
+    echo "hash=$HASH"
+    echo "at=$NOW"
+    exit 0
+  fi
+fi
+
+echo "$HASH" > "$PREV_HASH_FILE"
+echo "$NOW $HASH" >> "$STATE_DIR/changes.log"
+echo "CHANGED"
+echo "hash=$HASH"
+echo "at=$NOW"
+echo "list=$CROP"
+
+emit_full_region() {
+  # First run, or helper unavailable: one region = the full crop.
+  mkdir -p "$REGIONS_DIR"
+  python3 - "$REGIONS_JSON" "$CROP" "$CROP_W" "$CROP_H" << 'PY'
+import json, sys
+json_path, crop, w, h = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+recs = [{"x": 0, "y": 0, "w": w, "h": h, "path": crop}]
+with open(json_path, "w", encoding="utf-8") as f:
+    json.dump(recs, f, indent=2)
+    f.write("\n")
+PY
+  echo "regions=1"
+  echo "region=$CROP"
+}
+
+if [ "$HAD_PREV" -eq 0 ]; then
+  emit_full_region
+  exit 0
+fi
+
+if [ -z "$REGIONS_PY" ] || ! command -v python3 >/dev/null 2>&1; then
+  echo "WARNING: region helper or python3 missing; falling back to full crop" >&2
+  emit_full_region
+  exit 0
+fi
+
+if ! WECHAT_FFMPEG="$FFMPEG" python3 "$REGIONS_PY" \
+  --prev "$PREV" \
+  --curr "$CROP" \
+  --out-dir "$REGIONS_DIR" \
+  --json "$REGIONS_JSON" \
+  --ffmpeg "$FFMPEG"
+then
+  echo "WARNING: region helper failed; falling back to full crop" >&2
+  emit_full_region
+  exit 0
+fi
+
+exit 0

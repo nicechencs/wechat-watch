@@ -1,0 +1,12 @@
+# Runtime / persist artifacts — never commit
+*.png
+*.sha256
+*.log
+*.rgb
+regions.json
+watch/
+bin/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.deb

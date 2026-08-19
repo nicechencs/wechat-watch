@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""Region crops for WeChat chat-list screenshot diffs.
+
+Decode two PNGs to raw rgb24 via persist ffmpeg (no Pillow). Find bounding
+boxes of changed pixels and write small crops plus regions.json so an agent
+can Read only the slices that changed.
+
+Usage:
+  wechat-watch-regions --prev PREV.png --curr CURR.png \\
+      --out-dir REGIONS_DIR --json OUT.json [--ffmpeg PATH]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+
+THRESH = 12
+MERGE_GAP = 16
+PAD = 8
+MIN_BOX = 20
+BADGE_MIN = 12
+BADGE_LEFT = 80
+MAX_BOXES = 6
+AREA_CAP = 0.40
+
+
+def png_size(path: str) -> tuple[int, int]:
+    with open(path, "rb") as f:
+        sig = f.read(8)
+        if sig != b"\x89PNG\r\n\x1a\n":
+            raise ValueError(f"not a PNG: {path}")
+        length = struct.unpack(">I", f.read(4))[0]
+        typ = f.read(4)
+        if typ != b"IHDR" or length < 8:
+            raise ValueError(f"missing IHDR: {path}")
+        w, h = struct.unpack(">II", f.read(8))
+        return w, h
+
+
+def decode_rgb24(ffmpeg: str, path: str, w: int, h: int, raw_path: str) -> bytes:
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        path,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        raw_path,
+    ]
+    subprocess.run(cmd, check=True)
+    data = open(raw_path, "rb").read()
+    expect = w * h * 3
+    if len(data) != expect:
+        raise ValueError(f"{path}: raw size {len(data)} != {expect} ({w}x{h} rgb24)")
+    return data
+
+
+def changed_mask(a: bytes, b: bytes, w: int, h: int) -> bytearray:
+    n = w * h
+    mask = bytearray(n)
+    # Pixel differs if any channel delta > THRESH.
+    for i in range(n):
+        o = i * 3
+        if (
+            abs(a[o] - b[o]) > THRESH
+            or abs(a[o + 1] - b[o + 1]) > THRESH
+            or abs(a[o + 2] - b[o + 2]) > THRESH
+        ):
+            mask[i] = 1
+    return mask
+
+
+def denoise(mask: bytearray, w: int, h: int) -> bytearray:
+    """Drop isolated single pixels; keep a pixel if any 8-neighbor is also on."""
+    kept = bytearray(w * h)
+    for y in range(h):
+        row = y * w
+        for x in range(w):
+            i = row + x
+            if not mask[i]:
+                continue
+            found = False
+            y0 = 0 if y == 0 else y - 1
+            y1 = h - 1 if y == h - 1 else y + 1
+            x0 = 0 if x == 0 else x - 1
+            x1 = w - 1 if x == w - 1 else x + 1
+            for ny in range(y0, y1 + 1):
+                nrow = ny * w
+                for nx in range(x0, x1 + 1):
+                    if nx == x and ny == y:
+                        continue
+                    if mask[nrow + nx]:
+                        found = True
+                        break
+                if found:
+                    break
+            if found:
+                kept[i] = 1
+    return kept
+
+
+def components(mask: bytearray, w: int, h: int) -> list[tuple[int, int, int, int]]:
+    """8-connected bounding boxes of kept pixels."""
+    seen = bytearray(w * h)
+    boxes: list[tuple[int, int, int, int]] = []
+    nbrs = ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1))
+    for y in range(h):
+        row = y * w
+        for x in range(w):
+            i = row + x
+            if not mask[i] or seen[i]:
+                continue
+            minx = maxx = x
+            miny = maxy = y
+            stack = [i]
+            seen[i] = 1
+            while stack:
+                j = stack.pop()
+                jx = j % w
+                jy = j // w
+                if jx < minx:
+                    minx = jx
+                elif jx > maxx:
+                    maxx = jx
+                if jy < miny:
+                    miny = jy
+                elif jy > maxy:
+                    maxy = jy
+                for dy, dx in nbrs:
+                    nx = jx + dx
+                    ny = jy + dy
+                    if 0 <= nx < w and 0 <= ny < h:
+                        ni = ny * w + nx
+                        if mask[ni] and not seen[ni]:
+                            seen[ni] = 1
+                            stack.append(ni)
+            boxes.append((minx, miny, maxx - minx + 1, maxy - miny + 1))
+    return boxes
+
+
+def boxes_close(a: tuple[int, int, int, int], b: tuple[int, int, int, int], gap: int) -> bool:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    h_gap = max(0, max(ax, bx) - min(ax + aw, bx + bw))
+    v_gap = max(0, max(ay, by) - min(ay + ah, by + bh))
+    return h_gap <= gap and v_gap <= gap
+
+
+def merge_boxes(boxes: list[tuple[int, int, int, int]], gap: int) -> list[tuple[int, int, int, int]]:
+    cur = list(boxes)
+    changed = True
+    while changed:
+        changed = False
+        out: list[tuple[int, int, int, int]] = []
+        used = [False] * len(cur)
+        for i, a in enumerate(cur):
+            if used[i]:
+                continue
+            ax, ay, aw, ah = a
+            for j in range(i + 1, len(cur)):
+                if used[j]:
+                    continue
+                b = cur[j]
+                if boxes_close((ax, ay, aw, ah), b, gap):
+                    bx, by, bw, bh = b
+                    x1 = min(ax, bx)
+                    y1 = min(ay, by)
+                    x2 = max(ax + aw, bx + bw)
+                    y2 = max(ay + ah, by + bh)
+                    ax, ay, aw, ah = x1, y1, x2 - x1, y2 - y1
+                    used[j] = True
+                    changed = True
+            out.append((ax, ay, aw, ah))
+        cur = out
+    return cur
+
+
+def pad_box(box: tuple[int, int, int, int], w: int, h: int, pad: int) -> tuple[int, int, int, int]:
+    x, y, bw, bh = box
+    x1 = max(0, x - pad)
+    y1 = max(0, y - pad)
+    x2 = min(w, x + bw + pad)
+    y2 = min(h, y + bh + pad)
+    return (x1, y1, x2 - x1, y2 - y1)
+
+
+def is_badge(box: tuple[int, int, int, int]) -> bool:
+    x, y, bw, bh = box
+    return x < BADGE_LEFT and bw >= BADGE_MIN and bh >= BADGE_MIN
+
+
+def filter_boxes(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    kept = []
+    for b in boxes:
+        _x, _y, bw, bh = b
+        if bw >= MIN_BOX and bh >= MIN_BOX:
+            kept.append(b)
+        elif is_badge(b):
+            kept.append(b)
+    return kept
+
+
+def union_area(boxes: list[tuple[int, int, int, int]], w: int, h: int) -> int:
+    if not boxes:
+        return 0
+    cov = bytearray(w * h)
+    for x, y, bw, bh in boxes:
+        for yy in range(y, min(h, y + bh)):
+            row = yy * w
+            x2 = min(w, x + bw)
+            for xx in range(max(0, x), x2):
+                cov[row + xx] = 1
+    return sum(cov)
+
+
+def crop_png(ffmpeg: str, src: str, dest: str, box: tuple[int, int, int, int]) -> None:
+    x, y, bw, bh = box
+    vf = f"crop={bw}:{bh}:{x}:{y}"
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        src,
+        "-filter:v",
+        vf,
+        dest,
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def compute_regions(
+    prev_path: str,
+    curr_path: str,
+    ffmpeg: str,
+) -> tuple[list[tuple[int, int, int, int]], int, int, int]:
+    """Return (boxes, width, height, changed_pixels). Empty boxes → caller uses full crop."""
+    w, h = png_size(curr_path)
+    pw, ph = png_size(prev_path)
+    if (pw, ph) != (w, h):
+        # Size mismatch: treat as too much changed.
+        return ([(0, 0, w, h)], w, h, w * h)
+
+    with tempfile.TemporaryDirectory(prefix="wechat-watch-") as td:
+        a = decode_rgb24(ffmpeg, prev_path, w, h, os.path.join(td, "a.rgb"))
+        b = decode_rgb24(ffmpeg, curr_path, w, h, os.path.join(td, "b.rgb"))
+
+    raw = changed_mask(a, b, w, h)
+    kept = denoise(raw, w, h)
+    changed_n = sum(kept)
+    crop_area = w * h
+
+    if changed_n == 0:
+        return ([], w, h, 0)
+
+    if changed_n > AREA_CAP * crop_area:
+        return ([(0, 0, w, h)], w, h, changed_n)
+
+    boxes = components(kept, w, h)
+    boxes = merge_boxes(boxes, MERGE_GAP)
+    boxes = filter_boxes(boxes)
+    boxes = [pad_box(b, w, h, PAD) for b in boxes]
+
+    if not boxes:
+        return ([(0, 0, w, h)], w, h, changed_n)
+
+    if union_area(boxes, w, h) > AREA_CAP * crop_area:
+        return ([(0, 0, w, h)], w, h, changed_n)
+
+    boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
+    if len(boxes) > MAX_BOXES:
+        boxes = boxes[:MAX_BOXES]
+    # Stable reading order: top-to-bottom, then left-to-right.
+    boxes.sort(key=lambda b: (b[1], b[0]))
+    return (boxes, w, h, changed_n)
+
+
+def write_outputs(
+    boxes: list[tuple[int, int, int, int]],
+    curr_path: str,
+    out_dir: str,
+    json_path: str,
+    ffmpeg: str,
+    full_fallback: bool = False,
+) -> list[dict]:
+    os.makedirs(out_dir, exist_ok=True)
+    # Drop stale rN.png from a previous CHANGED.
+    if os.path.isdir(out_dir):
+        for name in os.listdir(out_dir):
+            if name.startswith("r") and name.endswith(".png"):
+                try:
+                    os.remove(os.path.join(out_dir, name))
+                except OSError:
+                    pass
+
+    recs = []
+    if full_fallback or (len(boxes) == 1 and boxes[0][0] == 0 and boxes[0][1] == 0
+                         and os.path.samefile(curr_path, curr_path)):
+        pass
+
+    for i, box in enumerate(boxes):
+        dest = os.path.join(out_dir, f"r{i}.png")
+        x, y, bw, bh = box
+        # Full-crop box: still write r0.png (copy via ffmpeg crop of whole frame).
+        crop_png(ffmpeg, curr_path, dest, box)
+        recs.append(
+            {
+                "x": int(x),
+                "y": int(y),
+                "w": int(bw),
+                "h": int(bh),
+                "path": dest,
+            }
+        )
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(recs, f, indent=2)
+        f.write("\n")
+    return recs
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="WeChat list.png region crops")
+    p.add_argument("--prev", required=True, help="previous list.png")
+    p.add_argument("--curr", required=True, help="current list.png")
+    p.add_argument("--out-dir", required=True, help="directory for rN.png crops")
+    p.add_argument("--json", required=True, help="regions.json path")
+    p.add_argument(
+        "--ffmpeg",
+        default=os.environ.get(
+            "WECHAT_FFMPEG",
+            "/home/box/.local/share/wechat-persist/bin/ffmpeg",
+        ),
+    )
+    args = p.parse_args()
+
+    if not os.path.isfile(args.prev):
+        print(f"ERROR: prev missing: {args.prev}", file=sys.stderr)
+        return 2
+    if not os.path.isfile(args.curr):
+        print(f"ERROR: curr missing: {args.curr}", file=sys.stderr)
+        return 2
+    ffmpeg = args.ffmpeg
+    if not os.path.isfile(ffmpeg) or not os.access(ffmpeg, os.X_OK):
+        # Fall back to PATH ffmpeg.
+        ffmpeg = "ffmpeg"
+
+    boxes, _w, _h, _n = compute_regions(args.prev, args.curr, ffmpeg)
+    if not boxes:
+        w, h = png_size(args.curr)
+        boxes = [(0, 0, w, h)]
+    recs = write_outputs(boxes, args.curr, args.out_dir, args.json, ffmpeg)
+    print(f"regions={len(recs)}")
+    for rec in recs:
+        print(f"region={rec['path']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
