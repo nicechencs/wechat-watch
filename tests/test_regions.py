@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Region-diff + Chinese/English OCR tests for wechat-watch-regions."""
+"""Region-diff + Chinese/English OCR + thread-pane tests for wechat-watch-regions."""
 from __future__ import annotations
 
 import importlib.util
@@ -286,6 +286,491 @@ class OcrTests(unittest.TestCase):
         self.assertEqual(regions.pick_psm((0, 0, 440, 700)), 6)
         # Tall narrow preview strip: still a block, not a single line.
         self.assertEqual(regions.pick_psm((356, 38, 84, 308)), 6)
+
+
+
+class ThreadPaneTests(unittest.TestCase):
+    """Group-chat / right-pane: thread-sized split + left/right → in/out."""
+
+    def test_infer_side_left_is_in(self):
+        # 720-wide thread crop; left third ends at 240.
+        self.assertEqual(regions.infer_side((20, 40, 80, 50), 720), "in")
+        self.assertEqual(regions.infer_side((0, 10, 60, 40), 720), "in")
+
+    def test_infer_side_right_is_out(self):
+        # Right third starts at 480.
+        self.assertEqual(regions.infer_side((500, 40, 80, 50), 720), "out")
+        self.assertEqual(regions.infer_side((640, 80, 70, 40), 720), "out")
+
+    def test_infer_side_middle_or_wide_is_unknown(self):
+        self.assertEqual(regions.infer_side((300, 40, 80, 50), 720), "unknown")
+        # Full-width fallback crop is not a single bubble.
+        self.assertEqual(regions.infer_side((0, 0, 720, 660), 720), "unknown")
+
+    def test_expand_top_grows_upward(self):
+        box = (100, 80, 60, 40)
+        grown = regions.expand_top(box, 720, 660, 22)
+        self.assertEqual(grown[0], 100)
+        self.assertEqual(grown[1], 58)
+        self.assertEqual(grown[2], 60)
+        self.assertEqual(grown[3], 62)
+        self.assertEqual(regions.expand_top(box, 720, 660, 0), box)
+        # Clamp at y=0.
+        self.assertEqual(regions.expand_top((10, 5, 20, 20), 720, 660, 22)[1], 0)
+
+    def test_thread_sized_crop_region_split(self):
+        """A 720x620 thread crop with left + right bubbles yields two boxes."""
+        self.assertTrue(os.path.isfile(PERSIST_FFMPEG), "persist ffmpeg missing")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-thread-") as td:
+            prev = os.path.join(td, "prev.png")
+            curr = os.path.join(td, "curr.png")
+            write_solid_png(prev, 720, 620, "white")
+            run_ffmpeg(
+                PERSIST_FFMPEG,
+                [
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=white:s=720x620",
+                    "-frames:v",
+                    "1",
+                    "-update",
+                    "1",
+                    "-vf",
+                    "drawbox=x=30:y=80:w=120:h=70:color=black:t=fill,"
+                    "drawbox=x=540:y=300:w=120:h=70:color=black:t=fill",
+                    curr,
+                ],
+            )
+            boxes, w, h, n = regions.compute_regions(prev, curr, PERSIST_FFMPEG)
+            self.assertEqual((w, h), (720, 620))
+            self.assertGreater(n, 0)
+            self.assertEqual(len(boxes), 2)
+            # Reading order: top-to-bottom.
+            self.assertLess(boxes[0][1], boxes[1][1])
+            sides = [regions.infer_side(b, w) for b in boxes]
+            self.assertEqual(sides[0], "in")
+            self.assertEqual(sides[1], "out")
+
+    def test_cli_thread_prefix_label_side(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-thread-cli-") as td:
+            prev = os.path.join(td, "prev.png")
+            curr = os.path.join(td, "curr.png")
+            out_dir = os.path.join(td, "thread-regions")
+            js = os.path.join(td, "thread-regions.json")
+            write_solid_png(prev, 720, 620, "white")
+            write_box_png(curr, 720, 620, (520, 80, 100, 60), "black")
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "--prev",
+                    prev,
+                    "--curr",
+                    curr,
+                    "--out-dir",
+                    out_dir,
+                    "--json",
+                    js,
+                    "--ffmpeg",
+                    PERSIST_FFMPEG,
+                    "--prefix",
+                    "t",
+                    "--label",
+                    "thread_",
+                    "--emit-side",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            lines = [ln for ln in proc.stdout.splitlines() if ln]
+            self.assertTrue(lines[0].startswith("thread_regions="), proc.stdout)
+            self.assertTrue(
+                any(ln.startswith("thread_region=") and "/t0.png" in ln for ln in lines),
+                proc.stdout,
+            )
+            self.assertTrue(any(ln == "thread_side0=out" for ln in lines), proc.stdout)
+            self.assertTrue(any(ln.startswith("thread_kind0=") for ln in lines), proc.stdout)
+            self.assertTrue(os.path.isfile(os.path.join(out_dir, "t0.png")))
+            with open(js, encoding="utf-8") as fh:
+                recs = json.loads(fh.read())
+            self.assertEqual(recs[0].get("side"), "out")
+
+
+class GcTests(unittest.TestCase):
+    """wechat-watch-gc: expire clips/regions, keep hash crops + identities.json."""
+
+    GC = os.path.join(ROOT, "wechat-watch-gc")
+
+    def _touch_old(self, path: str, minutes_ago: int) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"x")
+        age = minutes_ago * 60 + 30
+        import time
+        ts = time.time() - age
+        os.utime(path, (ts, ts))
+
+    def test_gc_keeps_hash_crops_and_expires_old_regions(self):
+        self.assertTrue(os.path.isfile(self.GC), "wechat-watch-gc missing")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-gc-") as td:
+            watch = td
+            for name in ("list.png", "list.prev.png", "thread.png", "thread.prev.png"):
+                with open(os.path.join(watch, name), "wb") as f:
+                    f.write(b"keep")
+            with open(os.path.join(watch, "identities.json"), "w") as f:
+                f.write("{}")
+            # current CHANGED set
+            os.makedirs(os.path.join(watch, "regions"), exist_ok=True)
+            current = os.path.join(watch, "regions", "r0.png")
+            with open(current, "wb") as f:
+                f.write(b"cur")
+            with open(os.path.join(watch, "regions.json"), "w") as f:
+                json.dump([{"path": current}], f)
+            # stale region + old extra full
+            stale = os.path.join(watch, "regions", "r9.png")
+            self._touch_old(stale, 20)
+            extra_full = os.path.join(watch, "full-old.png")
+            self._touch_old(extra_full, 1)
+            newest_full = os.path.join(watch, "full.png")
+            with open(newest_full, "wb") as f:
+                f.write(b"full")
+            # parsed clip should vanish immediately
+            os.makedirs(os.path.join(watch, "clips"), exist_ok=True)
+            clip = os.path.join(watch, "clips", "scroll.mp4")
+            with open(clip, "wb") as f:
+                f.write(b"mp4")
+            with open(os.path.join(watch, "clips", "scroll.json"), "w") as f:
+                f.write("[]")
+            # old avatar
+            av = os.path.join(watch, "avatars", "a.png")
+            self._touch_old(av, 8 * 24 * 60)
+            proc = subprocess.run(
+                ["bash", self.GC],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "WECHAT_WATCH_DIR": watch},
+            )
+            self.assertTrue(os.path.isfile(os.path.join(watch, "list.png")))
+            self.assertTrue(os.path.isfile(os.path.join(watch, "thread.prev.png")))
+            self.assertTrue(os.path.isfile(os.path.join(watch, "identities.json")))
+            self.assertTrue(os.path.isfile(current), "latest region set must stay")
+            self.assertFalse(os.path.isfile(stale), "15-min-old region must go")
+            self.assertFalse(os.path.isfile(clip), "parsed clip must go")
+            self.assertFalse(os.path.isfile(av), "7-day-old avatar must go")
+            self.assertTrue(os.path.isfile(newest_full))
+            self.assertFalse(os.path.isfile(extra_full), "older full*.png must go")
+
+
+def write_banded_thread(
+    path: str,
+    w: int,
+    h: int,
+    y0: int,
+    colors: list[str],
+    thumb_y: int,
+    thumb_h: int = 40,
+    bar_h: int = 22,
+    gap: int = 18,
+    ffmpeg: str = PERSIST_FFMPEG,
+    scrollbar: bool = True,
+) -> None:
+    """Synthetic thread crop: horizontal content bands + optional right scrollbar."""
+    parts: list[str] = []
+    if scrollbar:
+        parts.append(f"drawbox=x={w - 12}:y=0:w=12:h={h}:color=0xDDDDDD:t=fill")
+    for i, color in enumerate(colors):
+        y = y0 + i * (bar_h + gap)
+        if y + bar_h > h - 4:
+            break
+        parts.append(
+            f"drawbox=x=24:y={y}:w={w - 50}:h={bar_h}:color={color}:t=fill"
+        )
+    if scrollbar:
+        ty = max(0, min(h - thumb_h, thumb_y))
+        parts.append(
+            f"drawbox=x={w - 10}:y={ty}:w=8:h={thumb_h}:color=0x555555:t=fill"
+        )
+    vf = ",".join(parts) if parts else "null"
+    run_ffmpeg(
+        ffmpeg,
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=white:s={w}x{h}",
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            "-vf",
+            vf,
+            path,
+        ],
+    )
+
+
+class AverageHashTests(unittest.TestCase):
+    def test_solid_colors_are_stable_and_distinct(self):
+        red = bytes([200, 20, 20] * 64)
+        blue = bytes([20, 20, 200] * 64)
+        white = bytes([255, 255, 255] * 64)
+        h_red = regions.average_hash_rgb(red, 8, 8)
+        h_blue = regions.average_hash_rgb(blue, 8, 8)
+        h_white = regions.average_hash_rgb(white, 8, 8)
+        self.assertGreaterEqual(len(h_red), 16)
+        self.assertRegex(h_red, r"^[0-9a-f]+$")
+        self.assertEqual(h_red, regions.average_hash_rgb(red, 8, 8))
+        self.assertNotEqual(h_red, h_blue)
+        self.assertNotEqual(h_red, h_white)
+
+    def test_png_hash_roundtrip(self):
+        self.assertTrue(os.path.isfile(PERSIST_FFMPEG), "persist ffmpeg missing")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-ahash-") as td:
+            a = os.path.join(td, "a.png")
+            b = os.path.join(td, "b.png")
+            write_solid_png(a, 48, 48, "red")
+            write_solid_png(b, 48, 48, "red")
+            ha = regions.average_hash_png(a, PERSIST_FFMPEG)
+            hb = regions.average_hash_png(b, PERSIST_FFMPEG)
+            self.assertEqual(ha, hb)
+            write_solid_png(b, 48, 48, "blue")
+            self.assertNotEqual(ha, regions.average_hash_png(b, PERSIST_FFMPEG))
+
+
+class IdentityTests(unittest.TestCase):
+    def test_bind_and_lookup_roundtrip(self):
+        data = regions.empty_identities()
+        regions.bind_identity(data, "阿坤", "aabbccddeeff0011")
+        self.assertEqual(regions.lookup_name(data, "aabbccddeeff0011"), "阿坤")
+        self.assertEqual(regions.lookup_hash(data, "阿坤"), "aabbccddeeff0011")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-id-") as td:
+            path = os.path.join(td, "identities.json")
+            regions.save_identities(path, data)
+            loaded = regions.load_identities(path)
+            self.assertEqual(regions.lookup_name(loaded, "AABBCCDDEEFF0011"), "阿坤")
+
+    def test_empty_name_or_hash_ignored(self):
+        data = regions.empty_identities()
+        regions.bind_identity(data, "阿坤", "")
+        self.assertEqual(data["by_name"], {})
+        regions.bind_identity(data, "", "abcd")
+        self.assertIn("abcd", data["by_hash"])
+        self.assertEqual(regions.lookup_name(data, "abcd"), "")
+
+
+class ScrollDetectTests(unittest.TestCase):
+    COLORS = ("red", "blue", "green", "black")
+
+    def test_should_record_never_on_list_change(self):
+        self.assertTrue(regions.should_record_scroll(False, True))
+        self.assertFalse(regions.should_record_scroll(True, True))
+        self.assertFalse(regions.should_record_scroll(False, False))
+        self.assertFalse(regions.should_record_scroll(True, False))
+
+    def test_cli_should_record_gates_list_change(self):
+        def run(list_changed: int, scrolling: int) -> str:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "--should-record",
+                    "--list-changed",
+                    str(list_changed),
+                    "--scrolling",
+                    str(scrolling),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return proc.stdout.strip()
+
+        self.assertEqual(run(0, 1), "record=1")
+        self.assertEqual(run(1, 1), "record=0")
+        self.assertEqual(run(0, 0), "record=0")
+
+    def test_identical_frames_not_scrolling(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-scroll-") as td:
+            prev = os.path.join(td, "prev.png")
+            curr = os.path.join(td, "curr.png")
+            write_banded_thread(prev, 360, 240, 30, self.COLORS, thumb_y=40)
+            write_banded_thread(curr, 360, 240, 30, self.COLORS, thumb_y=40)
+            info = regions.detect_scroll(prev, curr, PERSIST_FFMPEG)
+            self.assertFalse(info["scrolling"])
+            self.assertEqual(info["changed_frac"], 0.0)
+
+    def test_shifted_bands_and_thumb_is_scrolling(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-scroll-") as td:
+            prev = os.path.join(td, "prev.png")
+            curr = os.path.join(td, "curr.png")
+            write_banded_thread(prev, 360, 240, 20, self.COLORS, thumb_y=30)
+            write_banded_thread(curr, 360, 240, 56, self.COLORS, thumb_y=70)
+            info = regions.detect_scroll(prev, curr, PERSIST_FFMPEG)
+            self.assertTrue(info["scrolling"], info)
+            self.assertGreaterEqual(abs(info["shift"]), regions.SCROLL_SHIFT_MIN)
+            self.assertTrue(info["scrollbar"])
+
+    def test_small_new_bubble_is_not_scrolling(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-scroll-") as td:
+            prev = os.path.join(td, "prev.png")
+            curr = os.path.join(td, "curr.png")
+            write_banded_thread(prev, 360, 240, 20, self.COLORS, thumb_y=160)
+            # Same bands + a tiny new box; thumb stays put.
+            write_banded_thread(curr, 360, 240, 20, self.COLORS, thumb_y=160)
+            run_ffmpeg(
+                PERSIST_FFMPEG,
+                [
+                    "-i",
+                    curr,
+                    "-vf",
+                    "drawbox=x=80:y=200:w=36:h=20:color=black:t=fill",
+                    "-frames:v",
+                    "1",
+                    "-update",
+                    "1",
+                    curr + ".new.png",
+                ],
+            )
+            os.replace(curr + ".new.png", curr)
+            info = regions.detect_scroll(prev, curr, PERSIST_FFMPEG)
+            self.assertFalse(info["scrolling"], info)
+
+    def test_chat_switch_is_not_scrolling(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-scroll-") as td:
+            prev = os.path.join(td, "prev.png")
+            curr = os.path.join(td, "curr.png")
+            write_banded_thread(prev, 360, 240, 20, self.COLORS, thumb_y=30)
+            # Unrelated pattern: vertical-ish solid blocks, no shared row structure.
+            write_solid_png(curr, 360, 240, "0x3366CC")
+            info = regions.detect_scroll(prev, curr, PERSIST_FFMPEG)
+            self.assertFalse(info["scrolling"], info)
+
+    def test_cli_detect_scroll(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-scroll-cli-") as td:
+            prev = os.path.join(td, "prev.png")
+            curr = os.path.join(td, "curr.png")
+            write_banded_thread(prev, 360, 240, 20, self.COLORS, thumb_y=30)
+            write_banded_thread(curr, 360, 240, 56, self.COLORS, thumb_y=70)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "--detect-scroll",
+                    "--prev",
+                    prev,
+                    "--curr",
+                    curr,
+                    "--ffmpeg",
+                    PERSIST_FFMPEG,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("scrolling=1", proc.stdout)
+
+
+class TimelineParseTests(unittest.TestCase):
+    def test_parse_frames_emits_timeline_and_binds_avatar(self):
+        self.assertTrue(os.path.isfile(PERSIST_FFMPEG), "persist ffmpeg missing")
+        self.assertTrue(os.path.isfile(CJK_FONT), f"missing CJK font: {CJK_FONT}")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-tl-") as td:
+            frames = os.path.join(td, "frames")
+            os.makedirs(frames)
+            prev = os.path.join(frames, "f0001.png")
+            curr = os.path.join(frames, "f0002.png")
+            write_solid_png(prev, 720, 220, "white")
+            # Incoming row: red avatar on the left + CJK text (system ffmpeg drawtext).
+            ffmpeg = SYSTEM_FFMPEG if os.path.isfile(SYSTEM_FFMPEG) else "ffmpeg"
+            vf = (
+                "drawbox=x=8:y=50:w=40:h=40:color=red:t=fill,"
+                f"drawtext=fontfile={CJK_FONT}:text='{KNOWN_ZH}':"
+                "fontcolor=black:fontsize=36:x=70:y=54"
+            )
+            run_ffmpeg(
+                ffmpeg,
+                [
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=white:s=720x220",
+                    "-frames:v",
+                    "1",
+                    "-update",
+                    "1",
+                    "-vf",
+                    vf,
+                    curr,
+                ],
+            )
+            timeline_path = os.path.join(td, "timeline.json")
+            identities_path = os.path.join(td, "identities.json")
+            avatars_dir = os.path.join(td, "avatars")
+            recs = regions.parse_frames_dir(
+                frames,
+                PERSIST_FFMPEG,
+                timeline_path,
+                identities_path,
+                avatars_dir,
+                fps=4.0,
+            )
+            self.assertTrue(os.path.isfile(timeline_path))
+            with open(timeline_path, encoding="utf-8") as fh:
+                saved = json.loads(fh.read())
+            self.assertEqual(saved, recs)
+            self.assertGreaterEqual(len(recs), 1)
+            ev = recs[0]
+            self.assertIn(ev["side"], ("in", "out", "unknown"))
+            self.assertIn("t", ev)
+            self.assertIn("name", ev)
+            self.assertIn("avatar_hash", ev)
+            self.assertIn("text", ev)
+            # Incoming left box should classify as in and carry an aHash.
+            ins = [e for e in recs if e["side"] == "in"]
+            if ins:
+                self.assertRegex(ins[0]["avatar_hash"], r"^[0-9a-f]{16,}$")
+                joined = " ".join(e.get("text", "") for e in recs)
+                if KNOWN_ZH[0] in joined or KNOWN_ZH in joined:
+                    self.assertTrue(os.path.isfile(identities_path))
+
+    def test_timeline_event_shape(self):
+        ev = regions._timeline_event(0.5, "in", "阿坤", "abcd", "hello")
+        self.assertEqual(
+            ev,
+            {
+                "t": 0.5,
+                "side": "in",
+                "name": "阿坤",
+                "avatar_hash": "abcd",
+                "text": "hello",
+            },
+        )
+
+
+class DiffScriptContractTests(unittest.TestCase):
+    """wechat-watch-diff must hash the left list only and never start video on list change."""
+
+    DIFF = os.path.join(ROOT, "wechat-watch-diff")
+
+    def test_diff_script_hashes_list_only_and_gates_video(self):
+        self.assertTrue(os.path.isfile(self.DIFF))
+        with open(self.DIFF, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("LEFT chat list", text)
+        self.assertIn("maybe_record_scroll", text)
+        self.assertIn("should-record", text)
+        self.assertIn("detect-scroll", text)
+        self.assertIn("x11grab", text)
+        # Video grab uses the thread crop offset, not the full desktop.
+        self.assertIn("${THREAD_X}", text)
+        self.assertIn("${THREAD_Y}", text)
+        # CHANGED (list) path must not call record.
+        changed_tail = text.split('echo "CHANGED"', 1)[-1]
+        self.assertNotIn("maybe_record_scroll", changed_tail)
+        self.assertIn("run_gc", changed_tail)
 
 
 if __name__ == "__main__":

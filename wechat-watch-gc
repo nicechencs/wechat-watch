@@ -1,0 +1,182 @@
+#!/bin/bash
+# Expire watch screenshots and clips. Keep hashes, JSON, and the two-frame crops.
+# Called at the end of every wechat-watch-diff run. Cheap: find + mtime.
+#
+# Rules:
+#   - list.png / list.prev.png / thread.png / thread.prev.png: never delete
+#   - identities.json: never delete (name↔avatar hash)
+#   - watch/full.png: keep only the newest full*.png
+#   - regions/*.png and thread-regions/*.png: drop older than 15 min;
+#     always keep the latest set listed in the current JSON
+#   - clips (.mp4/.webm) + extracted frames: delete immediately if a sibling
+#     JSON exists (already parsed); otherwise keep at most the last clip
+#     for 10 minutes
+#   - avatar png/jpg under avatars/ or identities/: delete if older than 7 days
+set -euo pipefail
+
+WATCH="${WECHAT_WATCH_DIR:-/home/box/.local/share/wechat-persist/watch}"
+if [ ! -d "$WATCH" ]; then
+  exit 0
+fi
+
+is_protected() {
+  local base
+  base="$(basename "$1")"
+  case "$base" in
+    list.png|list.prev.png|thread.png|thread.prev.png|identities.json)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# Paths named in the current CHANGED JSON must survive (latest set).
+KEEP_FILE="$(mktemp)"
+cleanup_keep() { rm -f "$KEEP_FILE"; }
+trap cleanup_keep EXIT
+
+python3 - "$WATCH" "$KEEP_FILE" << 'PY' || true
+import json, os, sys
+watch, out = sys.argv[1], sys.argv[2]
+keep = set()
+for name in ("regions.json", "thread-regions.json"):
+    path = os.path.join(watch, name)
+    if not os.path.isfile(path):
+        continue
+    try:
+        recs = json.loads(open(path, encoding="utf-8").read())
+    except (OSError, json.JSONDecodeError):
+        continue
+    if not isinstance(recs, list):
+        continue
+    for rec in recs:
+        p = rec.get("path") if isinstance(rec, dict) else None
+        if p:
+            keep.add(os.path.abspath(p))
+with open(out, "w", encoding="utf-8") as f:
+    for p in sorted(keep):
+        f.write(p + "\n")
+PY
+
+should_keep() {
+  local path abs
+  path="$1"
+  is_protected "$path" && return 0
+  abs="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$path")"
+  if [ -f "$KEEP_FILE" ] && grep -Fxq "$abs" "$KEEP_FILE" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+delete_if_old() {
+  local path="$1"
+  local minutes="$2"
+  [ -f "$path" ] || return 0
+  should_keep "$path" && return 0
+  # -mmin +N: last modified more than N minutes ago
+  if find "$path" -type f -mmin "+${minutes}" | grep -q .; then
+    rm -f "$path"
+  fi
+}
+
+# --- parsed clips: delete video + frames immediately ---
+if [ -d "$WATCH/clips" ]; then
+  shopt -s nullglob
+  for v in "$WATCH/clips"/*.mp4 "$WATCH/clips"/*.webm; do
+    [ -e "$v" ] || continue
+    stem="${v%.*}"
+    parsed=0
+    if [ -f "${stem}.json" ] || [ -f "${stem}.messages.json" ]; then
+      parsed=1
+    fi
+    if [ "$parsed" -eq 1 ]; then
+      rm -f "$v"
+      rm -rf "${stem}.frames" "${stem}_frames" "${stem}-frames"
+      rm -f "${stem}"-*.png "${stem}"_*.png "${stem}"-*.jpg "${stem}"_*.jpg
+    fi
+  done
+  shopt -u nullglob
+fi
+
+# --- videos: keep at most the newest, and only for 10 minutes ---
+VID_LIST="$(mktemp)"
+find "$WATCH" \( -name '*.mp4' -o -name '*.webm' \) -type f -printf '%T@ %p\n' 2>/dev/null \
+  | sort -nr > "$VID_LIST" || true
+if [ -s "$VID_LIST" ]; then
+  newest=""
+  while read -r _ts vpath; do
+    [ -n "${vpath:-}" ] || continue
+    if [ -z "$newest" ]; then
+      newest="$vpath"
+      # Drop the last clip if it is older than 10 minutes.
+      delete_if_old "$vpath" 10
+    else
+      rm -f "$vpath"
+    fi
+  done < "$VID_LIST"
+fi
+rm -f "$VID_LIST"
+
+# --- extracted frames next to clips (10 min) ---
+for d in "$WATCH/frames" "$WATCH/clips" "$WATCH/clips/frames"; do
+  [ -d "$d" ] || continue
+  find "$d" \( -name '*.png' -o -name '*.jpg' \) -type f -print0 2>/dev/null \
+    | while IFS= read -r -d '' f; do
+        delete_if_old "$f" 10
+      done
+done
+
+# --- region / thread-region crops: 15 min (latest JSON set kept) ---
+for d in "$WATCH/regions" "$WATCH/thread-regions"; do
+  [ -d "$d" ] || continue
+  find "$d" \( -name '*.png' -o -name '*.jpg' \) -type f -print0 2>/dev/null \
+    | while IFS= read -r -d '' f; do
+        delete_if_old "$f" 15
+      done
+done
+
+# --- avatars: 7 days (7*24*60 = 10080 min); hashes stay in identities.json ---
+for d in "$WATCH/avatars" "$WATCH/identities"; do
+  [ -d "$d" ] || continue
+  find "$d" \( -name '*.png' -o -name '*.jpg' \) -type f -print0 2>/dev/null \
+    | while IFS= read -r -d '' f; do
+        delete_if_old "$f" 10080
+      done
+done
+
+# --- full.png: keep only the newest full*.png ---
+FULL_LIST="$(mktemp)"
+find "$WATCH" -maxdepth 1 \( -name 'full.png' -o -name 'full-*.png' -o -name 'full_*.png' \) \
+  -type f -printf '%T@ %p\n' 2>/dev/null | sort -nr > "$FULL_LIST" || true
+if [ -s "$FULL_LIST" ]; then
+  newest=""
+  while read -r _ts fpath; do
+    [ -n "${fpath:-}" ] || continue
+    if [ -z "$newest" ]; then
+      newest="$fpath"
+    else
+      rm -f "$fpath"
+    fi
+  done < "$FULL_LIST"
+fi
+rm -f "$FULL_LIST"
+
+# --- leftover watch png/jpg not otherwise classified: 15 min, still protect crops ---
+find "$WATCH" \( -name '*.png' -o -name '*.jpg' \) -type f -print0 2>/dev/null \
+  | while IFS= read -r -d '' f; do
+      base="$(basename "$f")"
+      case "$base" in
+        list.png|list.prev.png|thread.png|thread.prev.png|full.png|full-*.png|full_*.png)
+          continue
+          ;;
+      esac
+      case "$f" in
+        */regions/*|*/thread-regions/*|*/avatars/*|*/identities/*|*/clips/*|*/frames/*)
+          continue
+          ;;
+      esac
+      delete_if_old "$f" 15
+    done
+
+exit 0

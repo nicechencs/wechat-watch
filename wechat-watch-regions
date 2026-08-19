@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
-"""Region crops for WeChat chat-list screenshot diffs.
+"""Region crops, OCR, scroll detect, and scroll-timeline parse.
 
 Decode two PNGs to raw rgb24 via persist ffmpeg (no Pillow). Find bounding
 boxes of changed pixels and write small crops plus regions.json so an agent
 can Read only the slices that changed. After each rN.png, run tesseract
 (chi_sim+eng) so CHANGED text regions emit plain text (no vision needed).
 
+Scroll-history: detect rolling pixels / scrollbar in the thread crop, then
+parse a frame sequence into a JSON timeline (t, side, name, avatar_hash, text).
+Incoming avatars are average-hashed and bound to OCR'd nicknames in
+identities.json.
+
 Usage:
   wechat-watch-regions --prev PREV.png --curr CURR.png \\
       --out-dir REGIONS_DIR --json OUT.json [--ffmpeg PATH]
   wechat-watch-regions --full LIST.png --out-dir REGIONS_DIR --json OUT.json
+  wechat-watch-regions ... --prefix t --label thread_ --emit-side
+  wechat-watch-regions --detect-scroll --prev thread.prev.png --curr thread.png
+  wechat-watch-regions --parse-frames FRAMES_DIR --timeline OUT.json \\
+      --identities identities.json --avatars-dir avatars/
 """
 from __future__ import annotations
 
@@ -34,6 +43,20 @@ PERSIST_TESSDATA = "/home/box/.local/share/wechat-persist/tessdata"
 SHORT_H = 48
 SHORT_W = 96
 OCR_TIMEOUT = 30
+
+# Average-hash + scroll / identity constants.
+AHASH_SIZE = 8
+AVATAR_SIZE = 40
+AVATAR_X = 8
+NICK_H = 22
+NICK_MAX_CHARS = 24
+SCROLLBAR_STRIP = 12
+SCROLL_SHIFT_MIN = 8
+SCROLL_CORR_MIN = 0.45
+SCROLL_AREA_MIN = 0.12
+SCROLL_ROW_VAR_MIN = 80.0
+THUMB_MOVE_MIN = 4.0
+IDENTITIES_VERSION = 1
 
 # CJK Unified Ideographs + common extensions / compatibility (not punctuation).
 _CJK_RANGES = (
@@ -212,6 +235,36 @@ def pad_box(box: tuple[int, int, int, int], w: int, h: int, pad: int) -> tuple[i
     x2 = min(w, x + bw + pad)
     y2 = min(h, y + bh + pad)
     return (x1, y1, x2 - x1, y2 - y1)
+
+
+def expand_top(
+    box: tuple[int, int, int, int], w: int, h: int, extra: int
+) -> tuple[int, int, int, int]:
+    """Grow a box upward so a group-chat nickname line is included in OCR."""
+    if extra <= 0:
+        return box
+    x, y, bw, bh = box
+    y1 = max(0, y - extra)
+    return (x, y1, bw, bh + (y - y1))
+
+
+def infer_side(box: tuple[int, int, int, int], width: int) -> str:
+    """Incoming vs outgoing by box x: left third = in, right third = out.
+
+    Full-width (or nearly full-width) boxes are unknown — they are not a
+    single left- or right-aligned bubble.
+    """
+    if width <= 0:
+        return "unknown"
+    x, _y, bw, _bh = box
+    if bw >= width * (2.0 / 3.0):
+        return "unknown"
+    third = width / 3.0
+    if x < third:
+        return "in"
+    if x >= 2.0 * third:
+        return "out"
+    return "unknown"
 
 
 def is_badge(box: tuple[int, int, int, int]) -> bool:
@@ -415,16 +468,554 @@ def compute_regions(
     return (boxes, w, h, changed_n)
 
 
+def rgb_luma(r: int, g: int, b: int) -> int:
+    return (r * 30 + g * 59 + b * 11) // 100
+
+
+def average_hash_rgb(rgb: bytes, w: int, h: int, size: int = AHASH_SIZE) -> str:
+    """Average-hash a raw rgb24 buffer.
+
+    64 luma bits (16 hex) plus mean RGB (6 hex). The colour suffix keeps
+    flat avatars (solid red vs solid blue) from collapsing to the same
+    all-zero / all-one aHash.
+    """
+    nbits = size * size
+    nhex = (nbits + 3) // 4
+    if w <= 0 or h <= 0 or not rgb:
+        return "0" * (nhex + 6)
+    cells = [0] * nbits
+    counts = [0] * nbits
+    tr = tg = tb = 0
+    npx = w * h
+    for y in range(h):
+        cy = min(size - 1, y * size // h)
+        row = y * w * 3
+        for x in range(w):
+            cx = min(size - 1, x * size // w)
+            i = row + x * 3
+            r, g, b = rgb[i], rgb[i + 1], rgb[i + 2]
+            cells[cy * size + cx] += rgb_luma(r, g, b)
+            counts[cy * size + cx] += 1
+            tr += r
+            tg += g
+            tb += b
+    avgs = [(cells[i] // counts[i]) if counts[i] else 0 for i in range(nbits)]
+    mean = sum(avgs) // nbits
+    acc = 0
+    width = 0
+    out: list[str] = []
+    hexdigits = "0123456789abcdef"
+    for a in avgs:
+        acc = (acc << 1) | (1 if a >= mean else 0)
+        width += 1
+        if width == 4:
+            out.append(hexdigits[acc])
+            acc = 0
+            width = 0
+    if width:
+        acc <<= 4 - width
+        out.append(hexdigits[acc])
+    mean_r = tr // npx
+    mean_g = tg // npx
+    mean_b = tb // npx
+    return "".join(out) + f"{mean_r:02x}{mean_g:02x}{mean_b:02x}"
+
+
+def average_hash_png(path: str, ffmpeg: str, size: int = AHASH_SIZE) -> str:
+    w, h = png_size(path)
+    with tempfile.TemporaryDirectory(prefix="wechat-watch-ahash-") as td:
+        rgb = decode_rgb24(ffmpeg, path, w, h, os.path.join(td, "a.rgb"))
+    return average_hash_rgb(rgb, w, h, size=size)
+
+
+def row_lumas(rgb: bytes, w: int, h: int) -> list[int]:
+    """Mean luma per row (cheap vertical fingerprint)."""
+    rows: list[int] = []
+    area = max(1, w)
+    for y in range(h):
+        total = 0
+        off = y * w * 3
+        for x in range(w):
+            i = off + x * 3
+            total += rgb_luma(rgb[i], rgb[i + 1], rgb[i + 2])
+        rows.append(total // area)
+    return rows
+
+
+def row_variance(rows: list[int]) -> float:
+    if not rows:
+        return 0.0
+    mean = sum(rows) / len(rows)
+    return sum((v - mean) ** 2 for v in rows) / len(rows)
+
+
+def best_row_shift(
+    prev_rows: list[int], curr_rows: list[int], max_shift: int = 80
+) -> tuple[int, float]:
+    """Return (shift, pearson). Positive shift = content moved down in curr."""
+    n = min(len(prev_rows), len(curr_rows))
+    if n < 16:
+        return 0, 0.0
+    pa = prev_rows[:n]
+    pb = curr_rows[:n]
+    mean_a = sum(pa) / n
+    mean_b = sum(pb) / n
+    na = [v - mean_a for v in pa]
+    nb = [v - mean_b for v in pb]
+    best_s = 0
+    best = -1.0
+    min_overlap = max(16, n // 4)
+    for s in range(-max_shift, max_shift + 1):
+        if s >= 0:
+            length = n - s
+            if length < min_overlap:
+                continue
+            num = da = db = 0.0
+            for i in range(length):
+                va = na[i]
+                vb = nb[i + s]
+                num += va * vb
+                da += va * va
+                db += vb * vb
+        else:
+            length = n + s
+            if length < min_overlap:
+                continue
+            num = da = db = 0.0
+            for i in range(length):
+                va = na[i - s]
+                vb = nb[i]
+                num += va * vb
+                da += va * va
+                db += vb * vb
+        denom = (da * db) ** 0.5
+        score = (num / denom) if denom > 1e-6 else 0.0
+        if score > best:
+            best = score
+            best_s = s
+    return best_s, best
+
+
+def scrollbar_profile(rgb: bytes, w: int, h: int, strip: int = SCROLLBAR_STRIP) -> list[int]:
+    """Mean luma of the right-edge strip (scrollbar track / thumb)."""
+    sw = min(strip, w)
+    if sw <= 0 or h <= 0:
+        return []
+    x0 = w - sw
+    out: list[int] = []
+    for y in range(h):
+        total = 0
+        off = y * w * 3
+        for x in range(x0, w):
+            i = off + x * 3
+            total += rgb_luma(rgb[i], rgb[i + 1], rgb[i + 2])
+        out.append(total // sw)
+    return out
+
+
+def scrollbar_present(profile: list[int], min_range: int = 18) -> bool:
+    """True when the right strip looks like a track + darker thumb."""
+    if len(profile) < 24:
+        return False
+    lo, hi = min(profile), max(profile)
+    if hi - lo < min_range:
+        return False
+    mean = sum(profile) / len(profile)
+    longest = 0
+    run = 0
+    for v in profile:
+        if v < mean - 6:
+            run += 1
+            if run > longest:
+                longest = run
+        else:
+            run = 0
+    return 8 <= longest <= max(16, int(len(profile) * 0.85))
+
+
+def scrollbar_thumb_center(profile: list[int]) -> float | None:
+    if not scrollbar_present(profile):
+        return None
+    mean = sum(profile) / len(profile)
+    num = 0.0
+    den = 0.0
+    for i, v in enumerate(profile):
+        weight = mean - v
+        if weight > 0:
+            num += i * weight
+            den += weight
+    if den <= 0:
+        return None
+    return num / den
+
+
+def detect_scroll(prev_path: str, curr_path: str, ffmpeg: str) -> dict:
+    """Detect history-flipping in the thread crop (scrollbar / rolling pixels).
+
+    Chat-switch (almost everything new, no vertical correlation) is not a scroll.
+    A small new bubble at the bottom is not a scroll.
+    """
+    info = {
+        "scrolling": False,
+        "shift": 0,
+        "score": 0.0,
+        "changed_frac": 0.0,
+        "scrollbar": False,
+        "thumb_delta": None,
+    }
+    try:
+        w, h = png_size(curr_path)
+        pw, ph = png_size(prev_path)
+    except (OSError, ValueError):
+        return info
+    if (pw, ph) != (w, h) or w < 16 or h < 16:
+        return info
+
+    with tempfile.TemporaryDirectory(prefix="wechat-watch-scroll-") as td:
+        a = decode_rgb24(ffmpeg, prev_path, w, h, os.path.join(td, "a.rgb"))
+        b = decode_rgb24(ffmpeg, curr_path, w, h, os.path.join(td, "b.rgb"))
+
+    raw = changed_mask(a, b, w, h)
+    changed_n = sum(raw)
+    area = w * h
+    changed_frac = changed_n / area if area else 0.0
+    info["changed_frac"] = changed_frac
+
+    prev_prof = scrollbar_profile(a, w, h)
+    curr_prof = scrollbar_profile(b, w, h)
+    bar_now = scrollbar_present(curr_prof)
+    bar_prev = scrollbar_present(prev_prof)
+    info["scrollbar"] = bool(bar_now or bar_prev)
+    c0 = scrollbar_thumb_center(prev_prof)
+    c1 = scrollbar_thumb_center(curr_prof)
+    thumb_delta = None
+    if c0 is not None and c1 is not None:
+        thumb_delta = c1 - c0
+    info["thumb_delta"] = thumb_delta
+
+    # Content-only row fingerprints (drop the right scrollbar strip).
+    content_w = max(16, w - SCROLLBAR_STRIP)
+    prev_rows: list[int] = []
+    curr_rows: list[int] = []
+    for y in range(h):
+        pt = ct = 0
+        off = y * w * 3
+        for x in range(content_w):
+            i = off + x * 3
+            pt += rgb_luma(a[i], a[i + 1], a[i + 2])
+            ct += rgb_luma(b[i], b[i + 1], b[i + 2])
+        prev_rows.append(pt // content_w)
+        curr_rows.append(ct // content_w)
+
+    shift, score = best_row_shift(prev_rows, curr_rows)
+    info["shift"] = int(shift)
+    info["score"] = float(score)
+    structured = (
+        row_variance(prev_rows) >= SCROLL_ROW_VAR_MIN
+        and row_variance(curr_rows) >= SCROLL_ROW_VAR_MIN
+    )
+
+    rolling = (
+        structured
+        and abs(shift) >= SCROLL_SHIFT_MIN
+        and score >= SCROLL_CORR_MIN
+        and changed_frac >= SCROLL_AREA_MIN
+    )
+    thumb_moved = thumb_delta is not None and abs(thumb_delta) >= THUMB_MOVE_MIN
+    # 有滚动条才录屏：visible bar, or a clear rolling match (bar can be faint).
+    if not info["scrollbar"] and not rolling:
+        return info
+    if rolling or thumb_moved:
+        info["scrolling"] = True
+    return info
+
+
+def should_record_scroll(list_changed: bool, scrolling: bool) -> bool:
+    """List change (unread / chat switch) never starts video."""
+    return (not bool(list_changed)) and bool(scrolling)
+
+
+def empty_identities() -> dict:
+    return {"version": IDENTITIES_VERSION, "by_hash": {}, "by_name": {}}
+
+
+def load_identities(path: str) -> dict:
+    data = empty_identities()
+    if not path or not os.path.isfile(path):
+        return data
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.loads(fh.read())
+    except (OSError, json.JSONDecodeError):
+        return data
+    if not isinstance(raw, dict):
+        return data
+    by_hash = raw.get("by_hash")
+    by_name = raw.get("by_name")
+    if isinstance(by_hash, dict):
+        data["by_hash"] = {
+            str(k): v for k, v in by_hash.items() if isinstance(v, dict)
+        }
+    if isinstance(by_name, dict):
+        data["by_name"] = {str(k): str(v) for k, v in by_name.items() if v}
+    return data
+
+
+def save_identities(path: str, data: dict) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    out = {
+        "version": IDENTITIES_VERSION,
+        "by_hash": data.get("by_hash") or {},
+        "by_name": data.get("by_name") or {},
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def bind_identity(
+    data: dict, name: str, avatar_hash: str, updated: str | None = None
+) -> dict:
+    """Bind nickname ↔ average-hash. Empty name or hash is ignored."""
+    name = (name or "").strip()
+    avatar_hash = (avatar_hash or "").strip().lower()
+    if not avatar_hash:
+        return data
+    rec = dict((data.get("by_hash") or {}).get(avatar_hash) or {})
+    if name:
+        rec["name"] = name
+        data.setdefault("by_name", {})[name] = avatar_hash
+    if updated:
+        rec["updated"] = updated
+    rec["avatar_hash"] = avatar_hash
+    data.setdefault("by_hash", {})[avatar_hash] = rec
+    return data
+
+
+def lookup_name(data: dict, avatar_hash: str) -> str:
+    rec = (data.get("by_hash") or {}).get((avatar_hash or "").strip().lower()) or {}
+    return str(rec.get("name") or "")
+
+
+def lookup_hash(data: dict, name: str) -> str:
+    return str((data.get("by_name") or {}).get((name or "").strip()) or "")
+
+
+def incoming_avatar_box(
+    msg_box: tuple[int, int, int, int], frame_w: int, frame_h: int
+) -> tuple[int, int, int, int]:
+    """Incoming avatar sits on the left of a WeChat thread row (~40x40)."""
+    _x, y, _bw, _bh = msg_box
+    s = min(AVATAR_SIZE, frame_w, frame_h)
+    ax = min(AVATAR_X, max(0, frame_w - s))
+    ay = max(0, min(y, max(0, frame_h - s)))
+    return (ax, ay, s, s)
+
+
+def nickname_box(
+    msg_box: tuple[int, int, int, int], frame_w: int, frame_h: int
+) -> tuple[int, int, int, int]:
+    ax, ay, aw, _ah = incoming_avatar_box(msg_box, frame_w, frame_h)
+    nx = min(frame_w - 1, ax + aw + 6)
+    ny = ay
+    nw = max(1, min(200, frame_w - nx))
+    nh = max(1, min(NICK_H, frame_h - ny))
+    return (nx, ny, nw, nh)
+
+
+def parse_nickname(raw: str) -> str:
+    if not raw:
+        return ""
+    text = raw.strip().splitlines()[0].strip()
+    if not text or len(text) > NICK_MAX_CHARS:
+        return ""
+    kind, cleaned = classify_ocr(text)
+    if kind != "text":
+        return ""
+    return cleaned
+
+
+def list_frame_pngs(frames_dir: str) -> list[str]:
+    if not frames_dir or not os.path.isdir(frames_dir):
+        return []
+    names = [
+        n
+        for n in os.listdir(frames_dir)
+        if n.lower().endswith(".png") and not n.startswith(".")
+    ]
+    names.sort()
+    return [os.path.join(frames_dir, n) for n in names]
+
+
+def _timeline_event(
+    t: float,
+    side: str,
+    name: str,
+    avatar_hash: str,
+    text: str,
+) -> dict:
+    return {
+        "t": float(t),
+        "side": side,
+        "name": name or "",
+        "avatar_hash": avatar_hash or "",
+        "text": text or "",
+    }
+
+
+def parse_frame_events(
+    prev_path: str,
+    curr_path: str,
+    ffmpeg: str,
+    identities: dict,
+    avatars_dir: str,
+    t: float,
+    extra_top_pad: int = 22,
+) -> list[dict]:
+    """Region-diff one frame pair, OCR, hash incoming avatars, emit events."""
+    boxes, w, h, _n = compute_regions(prev_path, curr_path, ffmpeg)
+    if not boxes:
+        return []
+    events: list[dict] = []
+    if avatars_dir:
+        os.makedirs(avatars_dir, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="wechat-watch-ev-") as td:
+        for i, box in enumerate(boxes):
+            box = expand_top(box, w, h, extra_top_pad)
+            side = infer_side(box, w)
+            dest = os.path.join(td, f"r{i}.png")
+            try:
+                crop_png(ffmpeg, curr_path, dest, box)
+            except (OSError, subprocess.CalledProcessError):
+                continue
+            text, kind = ocr_png(dest, box)
+            if kind != "text":
+                text = ""
+            name = ""
+            avatar_hash = ""
+            if side == "in":
+                av_box = incoming_avatar_box(box, w, h)
+                av_path = os.path.join(td, f"av{i}.png")
+                try:
+                    crop_png(ffmpeg, curr_path, av_path, av_box)
+                    avatar_hash = average_hash_png(av_path, ffmpeg)
+                except (OSError, subprocess.CalledProcessError, ValueError):
+                    avatar_hash = ""
+                if avatar_hash and avatars_dir:
+                    keep = os.path.join(avatars_dir, f"{avatar_hash}.png")
+                    if not os.path.isfile(keep):
+                        try:
+                            with open(av_path, "rb") as src, open(keep, "wb") as dst:
+                                dst.write(src.read())
+                        except OSError:
+                            pass
+                nick_path = os.path.join(td, f"nick{i}.png")
+                try:
+                    crop_png(ffmpeg, curr_path, nick_path, nickname_box(box, w, h))
+                    nick_raw, _k = ocr_png(
+                        nick_path, nickname_box(box, w, h)
+                    )
+                    name = parse_nickname(nick_raw)
+                except (OSError, subprocess.CalledProcessError):
+                    name = ""
+                if not name and text:
+                    name = parse_nickname(text.splitlines()[0] if text else "")
+                if avatar_hash:
+                    if name:
+                        bind_identity(identities, name, avatar_hash)
+                    else:
+                        name = lookup_name(identities, avatar_hash)
+            if not text and not name:
+                continue
+            events.append(_timeline_event(t, side, name, avatar_hash, text))
+    return events
+
+
+def parse_frames_dir(
+    frames_dir: str,
+    ffmpeg: str,
+    timeline_path: str,
+    identities_path: str,
+    avatars_dir: str,
+    fps: float = 4.0,
+) -> list[dict]:
+    """Walk a frame sequence, emit a deduped {t,side,name,avatar_hash,text} timeline."""
+    frames = list_frame_pngs(frames_dir)
+    identities = load_identities(identities_path)
+    timeline: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    if fps <= 0:
+        fps = 4.0
+    if len(frames) == 1:
+        # Single still: treat as full-frame OCR against itself (no scroll).
+        pairs = [(frames[0], frames[0], 0.0)]
+    else:
+        pairs = [
+            (frames[i - 1], frames[i], i / fps) for i in range(1, len(frames))
+        ]
+    for prev_p, curr_p, t in pairs:
+        if prev_p == curr_p:
+            # First/only frame: one full-box event via annotate-style OCR.
+            try:
+                w, h = png_size(curr_p)
+            except (OSError, ValueError):
+                continue
+            text, kind = ocr_png(curr_p, (0, 0, w, h))
+            ev = _timeline_event(
+                t, infer_side((0, 0, w, h), w), "", "", text if kind == "text" else ""
+            )
+            if ev["text"]:
+                timeline.append(ev)
+            continue
+        for ev in parse_frame_events(
+            prev_p, curr_p, ffmpeg, identities, avatars_dir, t
+        ):
+            key = (ev["side"], ev["name"], ev["text"])
+            if key in seen:
+                continue
+            seen.add(key)
+            timeline.append(ev)
+    if identities_path:
+        save_identities(identities_path, identities)
+    if timeline_path:
+        parent = os.path.dirname(timeline_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        write_json(timeline, timeline_path)
+    return timeline
+
+
+def extract_clip_frames(ffmpeg: str, clip: str, dest_dir: str) -> list[str]:
+    os.makedirs(dest_dir, exist_ok=True)
+    pattern = os.path.join(dest_dir, "f%04d.png")
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        clip,
+        pattern,
+    ]
+    subprocess.run(cmd, check=True)
+    return list_frame_pngs(dest_dir)
+
+
 def write_json(recs: list[dict], json_path: str) -> None:
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(recs, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
 
-def emit_region_stdout(recs: list[dict]) -> None:
-    print(f"regions={len(recs)}")
+def emit_region_stdout(
+    recs: list[dict], label: str = "", emit_side: bool = False
+) -> None:
+    print(f"{label}regions={len(recs)}")
     for rec in recs:
-        print(f"region={rec['path']}")
+        print(f"{label}region={rec['path']}")
     for i, rec in enumerate(recs):
         kind = rec.get("kind", "image")
         if kind == "text":
@@ -434,8 +1025,10 @@ def emit_region_stdout(recs: list[dict]) -> None:
                 .replace("\n", "\\n")
                 .replace("\r", "\\n")
             )
-            print(f"text{i}={esc}")
-        print(f"kind{i}={kind}")
+            print(f"{label}text{i}={esc}")
+        print(f"{label}kind{i}={kind}")
+        if emit_side:
+            print(f"{label}side{i}={rec.get('side', 'unknown')}")
 
 
 def write_outputs(
@@ -446,12 +1039,18 @@ def write_outputs(
     ffmpeg: str,
     full_fallback: bool = False,
     ocr: bool = True,
+    prefix: str = "r",
+    extra_top_pad: int = 0,
+    emit_side: bool = False,
+    frame_w: int | None = None,
 ) -> list[dict]:
     os.makedirs(out_dir, exist_ok=True)
-    # Drop stale rN.png from a previous CHANGED.
+    if not prefix:
+        prefix = "r"
+    # Drop stale prefixN.png from a previous CHANGED (r0.png or t0.png).
     if os.path.isdir(out_dir):
         for name in os.listdir(out_dir):
-            if name.startswith("r") and name.endswith(".png"):
+            if name.startswith(prefix) and name.endswith(".png"):
                 try:
                     os.remove(os.path.join(out_dir, name))
                 except OSError:
@@ -462,10 +1061,16 @@ def write_outputs(
                          and os.path.samefile(curr_path, curr_path)):
         pass
 
+    if frame_w is None:
+        try:
+            frame_w, _fh = png_size(curr_path)
+        except (OSError, ValueError):
+            frame_w = 0
+
     for i, box in enumerate(boxes):
-        dest = os.path.join(out_dir, f"r{i}.png")
+        box = expand_top(box, frame_w or 0, 10**9, extra_top_pad)
+        dest = os.path.join(out_dir, f"{prefix}{i}.png")
         x, y, bw, bh = box
-        # Full-crop box: still write r0.png (copy via ffmpeg crop of whole frame).
         crop_png(ffmpeg, curr_path, dest, box)
         rec: dict = {
             "x": int(x),
@@ -474,6 +1079,8 @@ def write_outputs(
             "h": int(bh),
             "path": dest,
         }
+        if emit_side:
+            rec["side"] = infer_side(box, frame_w or 0)
         if ocr:
             text, kind = ocr_png(dest, box)
             rec["text"] = text
@@ -484,10 +1091,17 @@ def write_outputs(
     return recs
 
 
-def annotate_full(full_path: str, json_path: str, ocr: bool = True) -> list[dict]:
+def annotate_full(
+    full_path: str,
+    json_path: str,
+    ocr: bool = True,
+    emit_side: bool = False,
+) -> list[dict]:
     """One region = this png (no recrop). Used on first run / helper fallback."""
     w, h = png_size(full_path)
     rec: dict = {"x": 0, "y": 0, "w": int(w), "h": int(h), "path": full_path}
+    if emit_side:
+        rec["side"] = infer_side((0, 0, w, h), w)
     if ocr:
         text, kind = ocr_png(full_path, (0, 0, w, h))
         rec["text"] = text
@@ -514,28 +1128,144 @@ def resolve_ffmpeg(ffmpeg: str) -> str:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="WeChat list.png region crops + OCR")
-    p.add_argument("--prev", help="previous list.png")
-    p.add_argument("--curr", help="current list.png")
+    p = argparse.ArgumentParser(description="WeChat list/thread region crops + OCR")
+    p.add_argument("--prev", help="previous list.png or thread.png")
+    p.add_argument("--curr", help="current list.png or thread.png")
     p.add_argument(
         "--full",
         help="skip diff; treat this png as the single full region (no recrop)",
     )
-    p.add_argument("--out-dir", required=True, help="directory for rN.png crops")
-    p.add_argument("--json", required=True, help="regions.json path")
+    p.add_argument("--out-dir", help="directory for prefixN.png crops")
+    p.add_argument("--json", help="regions.json path")
     p.add_argument("--ffmpeg", default=default_ffmpeg())
+    p.add_argument(
+        "--prefix",
+        default="r",
+        help="crop filename prefix (r → r0.png, t → t0.png)",
+    )
+    p.add_argument(
+        "--label",
+        default="",
+        help="stdout key prefix (e.g. thread_ → thread_regions=)",
+    )
+    p.add_argument(
+        "--emit-side",
+        action="store_true",
+        help="emit sideN=in|out|unknown from box x position",
+    )
+    p.add_argument(
+        "--extra-top-pad",
+        type=int,
+        default=0,
+        help="extra pixels above each box (group-chat nickname line)",
+    )
+    p.add_argument(
+        "--detect-scroll",
+        action="store_true",
+        help="compare --prev/--curr thread crops; print scrolling=0|1",
+    )
+    p.add_argument(
+        "--should-record",
+        action="store_true",
+        help="print record=0|1 from --list-changed and --scrolling",
+    )
+    p.add_argument(
+        "--list-changed",
+        type=int,
+        default=0,
+        help="1 if the left chat list hash changed (never start video)",
+    )
+    p.add_argument(
+        "--scrolling",
+        type=int,
+        default=0,
+        help="1 if detect-scroll reported scrolling=1",
+    )
+    p.add_argument(
+        "--parse-frames",
+        help="directory of extracted thread frames → timeline JSON",
+    )
+    p.add_argument("--timeline", help="output JSON timeline path")
+    p.add_argument(
+        "--identities",
+        help="persist/watch/identities.json (name↔avatar hash)",
+    )
+    p.add_argument("--avatars-dir", help="directory to store avatar crops")
+    p.add_argument(
+        "--fps",
+        type=float,
+        default=4.0,
+        help="frame rate used to compute timeline t (seconds)",
+    )
     args = p.parse_args()
 
+    if args.should_record:
+        rec = should_record_scroll(bool(args.list_changed), bool(args.scrolling))
+        print(f"record={1 if rec else 0}")
+        return 0
+
+    if args.detect_scroll:
+        if not args.prev or not args.curr:
+            p.error("--detect-scroll requires --prev and --curr")
+        if not os.path.isfile(args.prev):
+            print(f"ERROR: prev missing: {args.prev}", file=sys.stderr)
+            return 2
+        if not os.path.isfile(args.curr):
+            print(f"ERROR: curr missing: {args.curr}", file=sys.stderr)
+            return 2
+        ffmpeg = resolve_ffmpeg(args.ffmpeg)
+        info = detect_scroll(args.prev, args.curr, ffmpeg)
+        print(f"scrolling={1 if info['scrolling'] else 0}")
+        print(f"shift={info['shift']}")
+        print(f"score={info['score']:.3f}")
+        print(f"scrollbar={1 if info['scrollbar'] else 0}")
+        print(f"changed_frac={info['changed_frac']:.3f}")
+        td = info.get("thumb_delta")
+        if td is None:
+            print("thumb_delta=")
+        else:
+            print(f"thumb_delta={td:.1f}")
+        return 0
+
+    if args.parse_frames:
+        if not os.path.isdir(args.parse_frames):
+            print(f"ERROR: frames dir missing: {args.parse_frames}", file=sys.stderr)
+            return 2
+        ffmpeg = resolve_ffmpeg(args.ffmpeg)
+        timeline_path = args.timeline or os.path.join(args.parse_frames, "timeline.json")
+        persist = os.environ.get(
+            "WECHAT_PERSIST", "/home/box/.local/share/wechat-persist"
+        )
+        identities_path = args.identities or os.path.join(
+            persist, "watch", "identities.json"
+        )
+        avatars_dir = args.avatars_dir or os.path.join(persist, "watch", "avatars")
+        recs = parse_frames_dir(
+            args.parse_frames,
+            ffmpeg,
+            timeline_path,
+            identities_path,
+            avatars_dir,
+            fps=args.fps,
+        )
+        print(f"messages={len(recs)}")
+        print(f"timeline={timeline_path}")
+        return 0
+
     if args.full:
+        if not args.json:
+            p.error("--json is required with --full")
         if not os.path.isfile(args.full):
             print(f"ERROR: full png missing: {args.full}", file=sys.stderr)
             return 2
-        recs = annotate_full(args.full, args.json)
-        emit_region_stdout(recs)
+        recs = annotate_full(args.full, args.json, emit_side=args.emit_side)
+        emit_region_stdout(recs, label=args.label, emit_side=args.emit_side)
         return 0
 
     if not args.prev or not args.curr:
-        p.error("--prev and --curr are required unless --full is set")
+        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record")
+    if not args.out_dir or not args.json:
+        p.error("--out-dir and --json are required unless --detect-scroll / --parse-frames / --should-record")
 
     if not os.path.isfile(args.prev):
         print(f"ERROR: prev missing: {args.prev}", file=sys.stderr)
@@ -545,13 +1275,24 @@ def main() -> int:
         return 2
     ffmpeg = resolve_ffmpeg(args.ffmpeg)
 
-    boxes, _w, _h, _n = compute_regions(args.prev, args.curr, ffmpeg)
+    boxes, w, h, _n = compute_regions(args.prev, args.curr, ffmpeg)
     if not boxes:
         w, h = png_size(args.curr)
         boxes = [(0, 0, w, h)]
-    recs = write_outputs(boxes, args.curr, args.out_dir, args.json, ffmpeg)
-    emit_region_stdout(recs)
+    recs = write_outputs(
+        boxes,
+        args.curr,
+        args.out_dir,
+        args.json,
+        ffmpeg,
+        prefix=args.prefix,
+        extra_top_pad=args.extra_top_pad,
+        emit_side=args.emit_side,
+        frame_w=w,
+    )
+    emit_region_stdout(recs, label=args.label, emit_side=args.emit_side)
     return 0
+
 
 
 if __name__ == "__main__":

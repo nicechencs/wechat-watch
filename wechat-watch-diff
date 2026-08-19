@@ -1,19 +1,26 @@
 #!/bin/bash
-# Cheap WeChat change detector: capture screen, crop chat list, compare hash.
+# Cheap WeChat change detector: capture screen, hash the LEFT chat list only.
 # Prints UNCHANGED or CHANGED. Never sends the image to a model.
-# Crop excludes the right compose pane (blinking cursor) and the dock.
-# On CHANGED, write region crops and OCR each slice (chi_sim+eng).
+# List change does NOT start video. Video is only recorded when the RIGHT
+# conversation pane is scrolling (scrollbar / rolling pixels in the thread crop).
+# Crops exclude the compose box, left list (for video), and the dock.
+# On CHANGED, write list region crops and OCR each slice (chi_sim+eng).
 set -euo pipefail
 
 DISPLAY_NUM="${DISPLAY:-:8}"
-PERSIST="/home/box/.local/share/wechat-persist"
-STATE_DIR="$PERSIST/watch"
+PERSIST="${WECHAT_PERSIST:-/home/box/.local/share/wechat-persist}"
+STATE_DIR="${WECHAT_WATCH_DIR:-$PERSIST/watch}"
 FULL="$STATE_DIR/full.png"
 CROP="$STATE_DIR/list.png"
 PREV="$STATE_DIR/list.prev.png"
 PREV_HASH_FILE="$STATE_DIR/list.sha256"
 REGIONS_DIR="$STATE_DIR/regions"
 REGIONS_JSON="$STATE_DIR/regions.json"
+THREAD="$STATE_DIR/thread.png"
+THREAD_PREV="$STATE_DIR/thread.prev.png"
+IDENTITIES="$STATE_DIR/identities.json"
+AVATARS_DIR="$STATE_DIR/avatars"
+CLIPS_DIR="$STATE_DIR/clips"
 PERSIST_FFMPEG="$PERSIST/bin/ffmpeg"
 # Prefer persist tessdata (survives reset) over the apt default path.
 export TESSDATA_PREFIX="${TESSDATA_PREFIX:-$PERSIST/tessdata}"
@@ -28,10 +35,34 @@ do
     break
   fi
 done
+GC_SH=""
+for cand in \
+  "/home/box/wechat-watch/wechat-watch-gc" \
+  "$PERSIST/wechat-watch-gc"
+do
+  if [ -x "$cand" ]; then
+    GC_SH="$cand"
+    break
+  fi
+done
+
+# Left chat list. Excludes compose + dock.
 CROP_W=440
 CROP_H=700
 CROP_X=70
 CROP_Y=30
+
+# Right conversation pane on 1280x800 WeChat 4.1 (divider at x=412,
+# compose toolbar at y=742). Must stay above the blinking cursor / dock.
+# x=414 (not 510) so incoming avatars + left-aligned bubbles are included.
+# Video records THIS rectangle only — never the list, compose box, or dock.
+THREAD_W=720
+THREAD_H=660
+THREAD_X=414
+THREAD_Y=40
+
+SCROLL_SECS="${WECHAT_SCROLL_SECS:-4}"
+SCROLL_FPS="${WECHAT_SCROLL_FPS:-4}"
 
 mkdir -p "$STATE_DIR"
 
@@ -56,13 +87,26 @@ if ! FFMPEG=$(find_ffmpeg); then
   fi
 fi
 
-# Keep previous crop before replacing list.png.
+run_gc() {
+  if [ -n "${GC_SH}" ]; then
+    WECHAT_WATCH_DIR="$STATE_DIR" "$GC_SH" >/dev/null 2>&1 || true
+  fi
+}
+
+# Keep previous crops before replacing.
 if [ -f "$CROP" ]; then
   cp -f "$CROP" "$PREV"
 fi
 HAD_PREV=0
 if [ -f "$PREV" ]; then
   HAD_PREV=1
+fi
+if [ -f "$THREAD" ]; then
+  cp -f "$THREAD" "$THREAD_PREV"
+fi
+HAD_PREV_THREAD=0
+if [ -f "$THREAD_PREV" ]; then
+  HAD_PREV_THREAD=1
 fi
 
 "$FFMPEG" -hide_banner -loglevel error -y \
@@ -72,28 +116,24 @@ fi
 "$FFMPEG" -hide_banner -loglevel error -y \
   -i "$FULL" -filter:v "crop=${CROP_W}:${CROP_H}:${CROP_X}:${CROP_Y}" "$CROP"
 
+# Always refresh the thread still (cheap). Used only for scroll detect,
+# never as the UNCHANGED/CHANGED decision.
+"$FFMPEG" -hide_banner -loglevel error -y \
+  -i "$FULL" -filter:v "crop=${THREAD_W}:${THREAD_H}:${THREAD_X}:${THREAD_Y}" "$THREAD"
+
 HASH=$(sha256sum "$CROP" | awk '{print $1}')
 NOW=$(date -Is)
 
+# Cheap live-unread: LEFT chat list hash only.
+LIST_CHANGED=1
 if [ -f "$PREV_HASH_FILE" ]; then
   OLD=$(cat "$PREV_HASH_FILE")
   if [ "$HASH" = "$OLD" ]; then
-    echo "UNCHANGED"
-    echo "hash=$HASH"
-    echo "at=$NOW"
-    exit 0
+    LIST_CHANGED=0
   fi
 fi
 
-echo "$HASH" > "$PREV_HASH_FILE"
-echo "$NOW $HASH" >> "$STATE_DIR/changes.log"
-echo "CHANGED"
-echo "hash=$HASH"
-echo "at=$NOW"
-echo "list=$CROP"
-
-emit_full_region() {
-  # First run, or helper unavailable: one region = the full crop (+ OCR).
+emit_full_list() {
   mkdir -p "$REGIONS_DIR"
   if [ -n "$REGIONS_PY" ] && command -v python3 >/dev/null 2>&1; then
     if WECHAT_FFMPEG="$FFMPEG" python3 "$REGIONS_PY" \
@@ -119,27 +159,135 @@ PY
   echo "kind0=image"
 }
 
+emit_list_diff() {
+  if [ -z "$REGIONS_PY" ] || ! command -v python3 >/dev/null 2>&1; then
+    echo "WARNING: region helper or python3 missing; falling back to full crop" >&2
+    emit_full_list
+    return 0
+  fi
+  if ! WECHAT_FFMPEG="$FFMPEG" python3 "$REGIONS_PY" \
+    --prev "$PREV" \
+    --curr "$CROP" \
+    --out-dir "$REGIONS_DIR" \
+    --json "$REGIONS_JSON" \
+    --ffmpeg "$FFMPEG"
+  then
+    echo "WARNING: region helper failed; falling back to full crop" >&2
+    emit_full_list
+    return 0
+  fi
+}
+
+# Record ONLY the scrollable thread rectangle, and ONLY when it is scrolling.
+# List change (unread / switching chats) never starts video.
+maybe_record_scroll() {
+  local list_changed="$1"
+  if [ -z "$REGIONS_PY" ] || ! command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+  # Gate first: list change must not start video, even if the thread looks busy.
+  local gate
+  gate="$(
+    python3 "$REGIONS_PY" --should-record \
+      --list-changed "$list_changed" --scrolling 1 2>/dev/null || true
+  )"
+  if [ "${gate:-}" != "record=1" ]; then
+    return 0
+  fi
+  if [ "$HAD_PREV_THREAD" -eq 0 ] || [ ! -f "$THREAD_PREV" ] || [ ! -f "$THREAD" ]; then
+    return 0
+  fi
+  # Thread still identical → not scrolling (skip the pixel pass).
+  if cmp -s "$THREAD" "$THREAD_PREV"; then
+    return 0
+  fi
+  local info scrolling
+  info="$(
+    WECHAT_FFMPEG="$FFMPEG" python3 "$REGIONS_PY" \
+      --detect-scroll --prev "$THREAD_PREV" --curr "$THREAD" --ffmpeg "$FFMPEG" \
+      2>/dev/null || true
+  )"
+  scrolling="$(printf '%s\n' "$info" | awk -F= '/^scrolling=/{print $2; exit}')"
+  if [ "${scrolling:-0}" != "1" ]; then
+    return 0
+  fi
+
+  mkdir -p "$CLIPS_DIR" "$AVATARS_DIR"
+  local stamp clip frames timeline
+  stamp="$(date +%Y%m%dT%H%M%S)"
+  clip="$CLIPS_DIR/scroll-${stamp}.mp4"
+  frames="$CLIPS_DIR/scroll-${stamp}.frames"
+  timeline="$CLIPS_DIR/scroll-${stamp}.json"
+
+  # x11grab the thread crop only (exclude list / compose / dock).
+  if ! "$FFMPEG" -hide_banner -loglevel error -y \
+    -f x11grab -draw_mouse 0 \
+    -video_size "${THREAD_W}x${THREAD_H}" \
+    -framerate "$SCROLL_FPS" \
+    -i "${DISPLAY_NUM}.0+${THREAD_X},${THREAD_Y}" \
+    -t "$SCROLL_SECS" \
+    -an -c:v libx264 -pix_fmt yuv420p \
+    "$clip"
+  then
+    echo "WARNING: thread scroll x11grab failed" >&2
+    rm -f "$clip"
+    return 0
+  fi
+  if [ ! -s "$clip" ]; then
+    rm -f "$clip"
+    return 0
+  fi
+
+  mkdir -p "$frames"
+  if ! "$FFMPEG" -hide_banner -loglevel error -y \
+    -i "$clip" "$frames/f%04d.png"
+  then
+    echo "WARNING: clip frame extract failed" >&2
+    return 0
+  fi
+
+  local parsed
+  parsed="$(
+    WECHAT_FFMPEG="$FFMPEG" python3 "$REGIONS_PY" \
+      --parse-frames "$frames" \
+      --timeline "$timeline" \
+      --identities "$IDENTITIES" \
+      --avatars-dir "$AVATARS_DIR" \
+      --ffmpeg "$FFMPEG" \
+      --fps "$SCROLL_FPS" \
+      2>/dev/null || true
+  )"
+  echo "scroll=1"
+  if [ -n "$parsed" ]; then
+    printf '%s\n' "$parsed"
+  else
+    echo "timeline=$timeline"
+  fi
+  echo "$NOW scroll $timeline" >> "$STATE_DIR/changes.log"
+}
+
+if [ "$LIST_CHANGED" -eq 0 ]; then
+  echo "UNCHANGED"
+  echo "hash=$HASH"
+  echo "at=$NOW"
+  maybe_record_scroll 0
+  run_gc
+  exit 0
+fi
+
+echo "$HASH" > "$PREV_HASH_FILE"
+echo "$NOW $HASH" >> "$STATE_DIR/changes.log"
+echo "CHANGED"
+echo "hash=$HASH"
+echo "at=$NOW"
+echo "list=$CROP"
+
 if [ "$HAD_PREV" -eq 0 ]; then
-  emit_full_region
-  exit 0
+  emit_full_list
+else
+  emit_list_diff
 fi
 
-if [ -z "$REGIONS_PY" ] || ! command -v python3 >/dev/null 2>&1; then
-  echo "WARNING: region helper or python3 missing; falling back to full crop" >&2
-  emit_full_region
-  exit 0
-fi
-
-if ! WECHAT_FFMPEG="$FFMPEG" python3 "$REGIONS_PY" \
-  --prev "$PREV" \
-  --curr "$CROP" \
-  --out-dir "$REGIONS_DIR" \
-  --json "$REGIONS_JSON" \
-  --ffmpeg "$FFMPEG"
-then
-  echo "WARNING: region helper failed; falling back to full crop" >&2
-  emit_full_region
-  exit 0
-fi
-
+# List change is the unread signal. It must not start video.
+run_gc
 exit 0
