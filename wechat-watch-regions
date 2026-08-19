@@ -22,6 +22,7 @@ Usage:
   wechat-watch-regions --format-time [--when ISO8601]
   wechat-watch-regions --ocr-still THREAD.png [--json OUT.json] [--when ISO8601]
   wechat-watch-regions --detect-unread LIST.png   # red badge / dot / [N条] (read-only)
+  wechat-watch-regions --detect-unread LIST.png --unread-compact  # cheap tokens
   wechat-watch-regions --detect-nav NAV.png       # left-nav icon badges (read-only)
   wechat-watch-regions --cache-images THREAD.png [--images-dir DIR]
       # read-only image-bubble crops; local persist only, never sent
@@ -55,6 +56,7 @@ PAD = 8
 MIN_BOX = 20
 BADGE_MIN = 12
 BADGE_LEFT = 80
+BADGE_RIGHT = 56  # keep a small right-edge badge-only pixel change
 MAX_BOXES = 6
 AREA_CAP = 0.40
 
@@ -148,6 +150,10 @@ UNREAD_MERGE_GAP = 3
 UNREAD_ROW_H = 70
 UNREAD_BADGE_OCR_SIDE = 160
 UNREAD_BADGE_PAD = 3
+UNREAD_AVATAR_MAX_X = 56  # left avatar column, ignore red here
+UNREAD_AVATAR_MAX_FRAC = 0.22
+UNREAD_BADGE_RIGHT_FRAC = 0.28  # right 28% of list width is the badge column
+UNREAD_WINDOW_MIN_W = 560  # wider than a list crop → window-local PNG
 TIAO_RE = re.compile(r"\[(\d+)\s*条\]")
 Z_MARK_RE = re.compile(r"(?<![A-Za-z0-9])([zZ])(?![A-Za-z0-9])")
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -386,18 +392,30 @@ def infer_side(box: tuple[int, int, int, int], width: int) -> str:
     return "unknown"
 
 
-def is_badge(box: tuple[int, int, int, int]) -> bool:
-    x, y, bw, bh = box
-    return x < BADGE_LEFT and bw >= BADGE_MIN and bh >= BADGE_MIN
+def is_badge(
+    box: tuple[int, int, int, int], frame_w: int | None = None
+) -> bool:
+    x, _y, bw, bh = box
+    if bw < BADGE_MIN or bh < BADGE_MIN:
+        return False
+    if x < BADGE_LEFT:
+        return True
+    # Official 4.x list badges sit on the right of the row.
+    if frame_w is not None and (x + bw) >= frame_w - BADGE_RIGHT:
+        return True
+    return False
 
 
-def filter_boxes(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+def filter_boxes(
+    boxes: list[tuple[int, int, int, int]],
+    frame_w: int | None = None,
+) -> list[tuple[int, int, int, int]]:
     kept = []
     for b in boxes:
         _x, _y, bw, bh = b
         if bw >= MIN_BOX and bh >= MIN_BOX:
             kept.append(b)
-        elif is_badge(b):
+        elif is_badge(b, frame_w):
             kept.append(b)
     return kept
 
@@ -705,7 +723,7 @@ def compute_regions(
 
     boxes = components(kept, w, h)
     boxes = merge_boxes(boxes, MERGE_GAP)
-    boxes = filter_boxes(boxes)
+    boxes = filter_boxes(boxes, w)
     boxes = [pad_box(b, w, h, PAD) for b in boxes]
 
     if not boxes:
@@ -1493,12 +1511,44 @@ def red_clusters(
     return out
 
 
+def is_list_row_badge(box: tuple[int, int, int, int], list_w: int) -> bool:
+    """True if a red blob sits in the right-hand list-row badge column.
+
+    Official Linux WeChat 4.x puts the unread circle / dot on the RIGHT of
+    the session row, not on the avatar. A red avatar on the left is not unread.
+    """
+    if list_w <= 0:
+        return False
+    x, _y, bw, _bh = box
+    cx = x + bw / 2.0
+    avatar_r = max(UNREAD_AVATAR_MAX_X, int(list_w * UNREAD_AVATAR_MAX_FRAC))
+    badge_l = min(list_w - 8, int(list_w * (1.0 - UNREAD_BADGE_RIGHT_FRAC)))
+    if cx < avatar_r:
+        return False
+    return cx >= badge_l
+
+
 def unread_source_box(w: int, h: int) -> tuple[int, int, int, int] | None:
-    """Crop LIST_CROP out of a 1280x800 desktop shot. Else use the whole PNG."""
+    """List crop from a desktop or window-local PNG. Already-a-list → None."""
     lw, lh, lx, ly = LIST_CROP
     if (w, h) == FULL_DESKTOP:
         return (lx, ly, lw, lh)
-    return None
+    # Already a list crop / synthetic row (440x700, 200x100, …).
+    if w <= UNREAD_WINDOW_MIN_W or h < NAV_WINDOW_MIN_H:
+        return None
+    # Window-local PNG: pane-relative insets, not desktop 70,30.
+    list_x = LIST_INSET
+    list_w = THREAD_INSET - LIST_INSET
+    top = pane_top_fallback(h)
+    bottom = pane_bottom_fallback(h)
+    if top + bottom >= h:
+        top, bottom = 0, 0
+    crop_h = max(1, h - top - bottom)
+    list_x = max(0, min(list_x, max(0, w - 1)))
+    top = max(0, min(top, max(0, h - 1)))
+    list_w = max(1, min(list_w, w - list_x))
+    crop_h = max(1, min(crop_h, h - top))
+    return (list_x, top, list_w, crop_h)
 
 
 def run_tesseract(
@@ -1731,8 +1781,12 @@ def merge_unread_rows(recs: list[dict], row_h: int = UNREAD_ROW_H) -> list[dict]
     return out
 
 
-def detect_unread(path: str, ffmpeg: str) -> list[dict]:
-    """Read-only: red number / red dot / [N条] / @ / z on the left chat list."""
+def detect_unread(path: str, ffmpeg: str, cheap: bool = False) -> list[dict]:
+    """Read-only: red number / red dot / [N条] / @ / z on the left chat list.
+
+    cheap=True (10s loop): right-column red blobs + tiny-badge OCR only.
+    Skip full-list OCR, [N条] text marks, and per-row title OCR.
+    """
     w, h = png_size(path)
     recs: list[dict] = []
     with tempfile.TemporaryDirectory(prefix="wechat-watch-unread-") as td:
@@ -1745,55 +1799,77 @@ def detect_unread(path: str, ffmpeg: str) -> list[dict]:
         rgb = decode_rgb24(ffmpeg, src, w, h, os.path.join(td, "list.rgb"))
         for i, (x, y, bw, bh, _n) in enumerate(red_clusters(rgb, w, h)):
             box = (x, y, bw, bh)
+            if not is_list_row_badge(box, w):
+                continue
             count = ocr_badge_count(ffmpeg, src, box, w, h, td)
             kind = "number" if count > 0 else "dot"
             label = str(count) if count else ""
             recs.append(_unread_rec(kind, count, label, box))
-        full_text, _kind = ocr_png(src, (0, 0, w, h))
-        marks = parse_text_marks(full_text)
-        if marks:
-            located = False
-            for bi, (y, bh) in enumerate(unread_row_bands(h)):
-                dest = os.path.join(td, f"band{bi}.png")
-                try:
-                    crop_png(ffmpeg, src, dest, (0, y, w, bh))
-                except (OSError, subprocess.CalledProcessError):
-                    continue
-                band_text, _k = ocr_png(dest, (0, y, w, bh))
-                for mark in parse_text_marks(band_text):
-                    recs.append(
-                        _unread_rec(
-                            "text",
-                            mark["count"],
-                            mark["label"],
-                            (0, y, w, bh),
+        if not cheap:
+            full_text, _kind = ocr_png(src, (0, 0, w, h))
+            marks = parse_text_marks(full_text)
+            if marks:
+                located = False
+                for bi, (y, bh) in enumerate(unread_row_bands(h)):
+                    dest = os.path.join(td, f"band{bi}.png")
+                    try:
+                        crop_png(ffmpeg, src, dest, (0, y, w, bh))
+                    except (OSError, subprocess.CalledProcessError):
+                        continue
+                    band_text, _k = ocr_png(dest, (0, y, w, bh))
+                    for mark in parse_text_marks(band_text):
+                        recs.append(
+                            _unread_rec(
+                                "text",
+                                mark["count"],
+                                mark["label"],
+                                (0, y, w, bh),
+                            )
                         )
-                    )
-                    located = True
-            if not located:
-                for mark in marks:
-                    recs.append(
-                        _unread_rec(
-                            "text",
-                            mark["count"],
-                            mark["label"],
-                            (0, 0, w, h),
+                        located = True
+                if not located:
+                    for mark in marks:
+                        recs.append(
+                            _unread_rec(
+                                "text",
+                                mark["count"],
+                                mark["label"],
+                                (0, 0, w, h),
+                            )
                         )
-                    )
         recs = merge_unread_rows(recs)
-        for i, rec in enumerate(recs):
-            if rec.get("name"):
-                continue
-            rec["name"] = ocr_row_title(
-                ffmpeg,
-                src,
-                (rec["x"], rec["y"], rec["w"], rec["h"]),
-                w,
-                h,
-                td,
-                i,
-            )
+        if not cheap:
+            for i, rec in enumerate(recs):
+                if rec.get("name"):
+                    continue
+                rec["name"] = ocr_row_title(
+                    ffmpeg,
+                    src,
+                    (rec["x"], rec["y"], rec["w"], rec["h"]),
+                    w,
+                    h,
+                    td,
+                    i,
+                )
     return recs
+
+
+def unread_line_token(rec: dict) -> str:
+    kind = rec.get("kind") or ""
+    count = int(rec.get("count") or 0)
+    if kind == "number" and count > 0:
+        return str(count)
+    if kind == "dot":
+        return "dot"
+    if kind == "text" and count > 0:
+        return str(count)
+    return "0"
+
+
+def emit_unread_compact(recs: list[dict]) -> None:
+    print(f"unread_rows={len(recs)}")
+    for i, rec in enumerate(recs):
+        print(f"unread{i}={unread_line_token(rec)}")
 
 
 def emit_unread_stdout(recs: list[dict]) -> None:
@@ -1807,6 +1883,7 @@ def emit_unread_stdout(recs: list[dict]) -> None:
         print(f"unread{i}_w={int(rec.get('w') or 0)}")
         print(f"unread{i}_h={int(rec.get('h') or 0)}")
         print(f"unread{i}_name={rec.get('name') or ''}")
+        print(f"unread{i}={unread_line_token(rec)}")
 
 
 def nav_source_box(w: int, h: int) -> tuple[int, int, int, int] | None:
@@ -3544,6 +3621,11 @@ def main() -> int:
         help="read-only: red badge / red dot / [N条] / @ / z on the left chat list",
     )
     p.add_argument(
+        "--unread-compact",
+        action="store_true",
+        help="with --detect-unread: cheap right-column badges only; compact unreadN= tokens",
+    )
+    p.add_argument(
         "--detect-nav",
         metavar="NAV.png",
         help="read-only: red badge / red dot on left-nav icons (by vertical slot)",
@@ -3649,8 +3731,13 @@ def main() -> int:
             print(f"ERROR: list png missing: {args.detect_unread}", file=sys.stderr)
             return 2
         ffmpeg = resolve_ffmpeg(args.ffmpeg)
-        recs = detect_unread(args.detect_unread, ffmpeg)
-        emit_unread_stdout(recs)
+        recs = detect_unread(
+            args.detect_unread, ffmpeg, cheap=bool(args.unread_compact)
+        )
+        if args.unread_compact:
+            emit_unread_compact(recs)
+        else:
+            emit_unread_stdout(recs)
         return 0
 
     if args.detect_nav:

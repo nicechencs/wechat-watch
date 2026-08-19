@@ -4,7 +4,9 @@
 # List change does NOT start video. Video is only recorded when the RIGHT
 # conversation pane is scrolling (scrollbar / rolling pixels in the thread crop).
 # Crops exclude the compose box, left list (for video), and the dock.
-# On CHANGED, write list region crops and OCR each slice (chi_sim+eng).
+# On CHANGED, write list region crops, OCR each slice (chi_sim+eng), and
+# cheap-scan right-column unread tokens (unreadN=数字|dot). Badge-only
+# change (same text fingerprint) is still CHANGED.
 set -euo pipefail
 
 DISPLAY_NUM="${DISPLAY:-:8}"
@@ -431,17 +433,39 @@ fi
 # Always store the new pixel hash so the next identical frame is cheap UNCHANGED.
 echo "$HASH" > "$PREV_HASH_FILE"
 
+# Cheap unread: right-column red badges only. Not on the LIST_CHANGED=0 path.
+UNREAD_OUT=""
+if [ -n "${REGIONS_PY}" ] && command -v python3 >/dev/null 2>&1 && [ -s "$CROP" ]; then
+  UNREAD_OUT="$(
+    python3 "$REGIONS_PY" --detect-unread "$CROP" --ffmpeg "$FFMPEG" --unread-compact 2>/dev/null || true
+  )"
+fi
+
 if [ -n "$FP" ] && [ -f "$LIST_TEXT_SHA" ]; then
   OLD_FP="$(tr -d '[:space:]' < "$LIST_TEXT_SHA")"
   if [ -n "$OLD_FP" ] && [ "$FP" = "$OLD_FP" ]; then
-    printf '%s\n' "$FP" > "$LIST_TEXT_SHA"
-    echo "UNCHANGED"
-    echo "hash=$HASH"
-    echo "at=$NOW"
-    echo "flap=1"
-    maybe_record_scroll 0
-    run_gc
-    exit 0
+    UNREAD_SAME=1
+    if [ "$HAD_PREV" -eq 1 ] && [ -f "$PREV" ] && [ -n "${REGIONS_PY}" ]; then
+      PREV_UNREAD="$(
+        python3 "$REGIONS_PY" --detect-unread "$PREV" --ffmpeg "$FFMPEG" --unread-compact 2>/dev/null || true
+      )"
+      _cur_u="$(printf '%s\n' "$UNREAD_OUT" | grep -E '^unread[0-9]+=' || true)"
+      _prev_u="$(printf '%s\n' "$PREV_UNREAD" | grep -E '^unread[0-9]+=' || true)"
+      if [ "$_cur_u" != "$_prev_u" ]; then
+        UNREAD_SAME=0
+      fi
+      unset _cur_u _prev_u PREV_UNREAD
+    fi
+    if [ "$UNREAD_SAME" -eq 1 ]; then
+      printf '%s\n' "$FP" > "$LIST_TEXT_SHA"
+      echo "UNCHANGED"
+      echo "hash=$HASH"
+      echo "at=$NOW"
+      echo "flap=1"
+      maybe_record_scroll 0
+      run_gc
+      exit 0
+    fi
   fi
 fi
 
@@ -456,7 +480,10 @@ echo "list=$CROP"
 if [ -n "$OCR_OUT" ]; then
   printf '%s\n' "$OCR_OUT"
 fi
+if [ -n "$UNREAD_OUT" ]; then
+  printf '%s\n' "$UNREAD_OUT"
+fi
 
-# List change is the unread signal. It must not start video.
+# List / unread change must not start video.
 run_gc
 exit 0

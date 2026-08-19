@@ -134,7 +134,7 @@ hash=715d94b8…
 at=2026-08-19T04:06:19+00:00
 ```
 
-此时不要读任何图片，也不要跑视觉模型。若正在翻历史，后面可能多出 `scroll=1` / `timeline=` 行。若只有列表像素在抖、OCR text0 没变，也会走这条，并多一行 `flap=1`。
+此时不要读任何图片，也不要跑视觉模型。若正在翻历史，后面可能多出 `scroll=1` / `timeline=` 行。若只有列表像素在抖、OCR text0 没变、且未读 token 也没变，也会走这条，并多一行 `flap=1`。徽章条数/红点单独变了（文字指纹相同）仍是 `CHANGED`。
 
 ### 有变化（列表）
 
@@ -150,6 +150,8 @@ text0=阿坤
 根据我的描述画：日落...
 kind0=text
 kind1=image
+unread_rows=1
+unread0=5
 ```
 
 列表变了只做列表差分和 OCR，**不会**因此开始录像。
@@ -210,21 +212,24 @@ kind1=image
 6. 小于 `20×20` 的框丢掉；左侧 `80px` 内、不小于 `12×12` 的当作红点徽章保留
 7. 最多 6 个框；变化面积超过裁剪区 `40%`（滚动、整页刷新）则退回整块列表
 
-差分只保留左侧小变化框（`is_badge` / `BADGE_LEFT=80`），**不会**扫红像素，也**不会**给出未读条数。要知道「哪一行未读」，用下面的 `--detect-unread`。
+差分会保留左侧小变化框（`is_badge` / `BADGE_LEFT=80`）以及靠近右缘的小框。像素差分本身**不会**扫红像素。10 秒 `wechat-watch-diff` 循环在列表哈希翻转后会跑廉价 `--detect-unread --unread-compact`，在 `CHANGED` 上输出 `unreadN=`。
 
 ## 未读标记（哪一行有红数字 / 红点 / [N条]）
 
-列表哈希仍是廉价信号：没变就是 `UNCHANGED`，到此结束。`--detect-unread` 是只读的第二步，用来指出**哪一行**有未读标记：
+列表哈希仍是廉价信号：像素没变就是 `UNCHANGED`，到此结束，不跑 `--detect-unread`。像素哈希变了之后，10 秒 `wechat-watch-diff` 循环会用 `--detect-unread --unread-compact` 扫当前列表裁剪，并在 `CHANGED` 上输出 `unreadN=数字|dot|0`。文字指纹（`list.text.sha`）相同但徽章 token 变了（只改条数 / 红点）仍是 `CHANGED`，不是 `flap=1`。
 
-- 头像右上角的鲜红圆标 + 白色数字（例如「5」）→ `kind=number`，`count` 为 OCR 到的数字
-- 很小的红点（免打扰 / 不显示条数）→ `kind=dot`
-- 预览里的 `[3条]` / `[12条]`、`@`、以及单独出现的 `z`/`Z` → `kind=text`
+官方 Linux 微信 4.x 的会话行徽章在**右侧**（不是头像上）：红圈白数字 / 小红点。左侧头像红不算未读。`--detect-unread` 也可单独跑：
+
+- 行右侧鲜红圆标 + 白色数字（例如「5」）→ `kind=number`，`count` 为 OCR 到的数字；紧凑行 `unread0=5`
+- 很小的红点（免打扰 / 标未读）→ `kind=dot`；紧凑行 `unread0=dot`
+- 预览里的 `[3条]` / `[12条]`、`@`、以及单独出现的 `z`/`Z` → `kind=text`（仅完整 CLI，不进 10 秒廉价扫描）
 
 ```
 ./wechat-watch-regions --detect-unread list.png
+./wechat-watch-regions --detect-unread list.png --unread-compact
 ```
 
-`list.png` 可以是已经裁好的 `440x700` 列表，也可以是整屏 `1280x800`（会先按 `LIST_CROP 440x700+70+30` 裁左侧）。输出例如：
+`list.png` 可以是已经裁好的 `440x700` 列表，也可以是整屏 `1280x800`（会先按 `LIST_CROP 440x700+70+30` 裁左侧），或窗口局部 PNG（按 `LIST_INSET` / `THREAD_INSET` 裁，不用桌面 70,30）。完整输出例如：
 
 ```
 unread_rows=1
@@ -236,6 +241,7 @@ unread0_y=54
 unread0_w=14
 unread0_h=14
 unread0_name=独立产品创业
+unread0=5
 ```
 
 不点击、不打字、不发送。列表预览仍然**不是**群记录；群内容以右侧对话区为准（见 [docs/group-handling.md](docs/group-handling.md)）。
@@ -259,7 +265,7 @@ unread0_name=独立产品创业
 python3 tests/test_regions.py
 ```
 
-当前覆盖：假色块切框、徽章保留、大面积变化回退、中英 OCR、CLI 的 `textN=` / `kindN=`、thread 尺寸切框、左右气泡 → `in`/`out`、滚动检测、列表变化不录像、头像 average-hash、identities 绑定、时间线 JSON、`wechat-watch-gc` 过期删除、UTC/Asia/Shanghai 双时区、`wechat-watch-thread --png` 只读 OCR、左侧未读标记（红数字 / 红点 / `[N条]`）、窗口 gutter 扫描（移动 vs 缩放 / DPI）、窗口 id 解析、列表 text0 指纹 / flap、注入式 AT-SPI 探测、image-bubble read-only cache / `--cache-images`、像素先分类 / `--classify`、时间分隔条 / `--detect-time`、会话名 / 昵称 `normalize_nick`。
+当前覆盖：假色块切框、徽章保留、大面积变化回退、中英 OCR、CLI 的 `textN=` / `kindN=`、thread 尺寸切框、左右气泡 → `in`/`out`、滚动检测、列表变化不录像、头像 average-hash、identities 绑定、时间线 JSON、`wechat-watch-gc` 过期删除、UTC/Asia/Shanghai 双时区、`wechat-watch-thread --png` 只读 OCR、列表右侧未读标记（红数字 / 红点 / `[N条]`）以及 10 秒循环的 `unreadN=`、窗口 gutter 扫描（移动 vs 缩放 / DPI）、窗口 id 解析、列表 text0 指纹 / flap、注入式 AT-SPI 探测、image-bubble read-only cache / `--cache-images`、像素先分类 / `--classify`、时间分隔条 / `--detect-time`、会话名 / 昵称 `normalize_nick`。
 
 ## 运行时文件（不进 git）
 
@@ -306,7 +312,7 @@ wechat-watch/
 
 左侧会话列表每一行预览都很短，群聊里「谁说了什么」单靠列表看不清。翻历史时以右侧对话区为准：
 
-- 未读轮询仍然只看左侧列表哈希，列表没变就是 `UNCHANGED`。`--detect-unread` 只回答「哪一行有红数字 / 红点 / [N条]」，列表预览仍不是群记录
+- 未读轮询仍然先看左侧列表哈希，列表没变就是 `UNCHANGED`。哈希变了会廉价扫右侧徽章并在 `CHANGED` 上打 `unreadN=`。`--detect-unread` 回答「哪一行有红数字 / 红点 / [N条]」，列表预览仍不是群记录
 - **翻历史、有滚动条才录屏**：只录对话区矩形，逐帧切气泡，`side=in|out`
 - 群聊昵称一般在气泡上方；解析时会向上多留约 22px，OCR 进时间线的 `name`
 - 对方头像 average-hash 后和昵称绑在 `identities.json`，下次同一头像即使 OCR 失败也能补上名字

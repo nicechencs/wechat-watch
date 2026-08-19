@@ -1056,25 +1056,40 @@ class UnreadMarkerTests(unittest.TestCase):
         self.assertIsNone(regions.unread_source_box(440, 700))
         self.assertIsNone(regions.unread_source_box(200, 100))
 
+    def test_unread_source_box_window_local(self):
+        self.assertEqual(regions.unread_source_box(1280, 800), (70, 30, 440, 700))
+        self.assertIsNone(regions.unread_source_box(440, 700))
+        self.assertIsNone(regions.unread_source_box(200, 100))
+        box = regions.unread_source_box(1019, 736)
+        self.assertIsNotNone(box)
+        self.assertNotEqual(box, (70, 30, 440, 700))
+        self.assertLessEqual(abs(box[0] - regions.LIST_INSET), 2, box)
+        self.assertNotEqual(box[0], 70)
+        # 200px list: avatar_r=64, badge_l=144. cx=175 kept; cx=40 dropped.
+        self.assertTrue(regions.is_list_row_badge((163, 20, 24, 24), 200))
+        self.assertFalse(regions.is_list_row_badge((28, 20, 24, 24), 200))
+        # 440px list: avatar_r=96, badge_l=316.
+        self.assertTrue(regions.is_list_row_badge((400, 20, 24, 24), 440))
+        self.assertFalse(regions.is_list_row_badge((28, 20, 24, 24), 440))
+
     def test_red_circle_digit_is_number(self):
         self.assertTrue(os.path.isfile(SYSTEM_FFMPEG), "system ffmpeg missing")
         with tempfile.TemporaryDirectory(prefix="wechat-watch-unread-n-") as td:
             png = os.path.join(td, "badge.png")
-            write_red_circle_png(png, 200, 100, cx=40, cy=36, radius=12, digit="5", fontsize=16)
+            write_red_circle_png(png, 200, 100, cx=175, cy=36, radius=12, digit="5", fontsize=16)
             recs = regions.detect_unread(png, PERSIST_FFMPEG)
-            kinds = [r["kind"] for r in recs]
-            self.assertIn("number", kinds, recs)
-            num = next(r for r in recs if r["kind"] == "number")
-            self.assertEqual(num["count"], 5)
-            self.assertGreater(num["w"], 0)
-            self.assertGreater(num["h"], 0)
+            self.assertEqual(len(recs), 1, recs)
+            self.assertEqual(recs[0]["kind"], "number")
+            self.assertEqual(recs[0]["count"], 5)
+            self.assertGreater(recs[0]["w"], 0)
+            self.assertGreater(recs[0]["h"], 0)
 
     def test_small_red_dot_is_dot(self):
         with tempfile.TemporaryDirectory(prefix="wechat-watch-unread-d-") as td:
             png = os.path.join(td, "dot.png")
-            write_red_circle_png(png, 120, 80, cx=40, cy=40, radius=4, digit=None)
+            write_red_circle_png(png, 120, 80, cx=100, cy=40, radius=4, digit=None)
             recs = regions.detect_unread(png, PERSIST_FFMPEG)
-            self.assertTrue(recs, "expected a red-dot unread")
+            self.assertEqual(len(recs), 1, recs)
             self.assertEqual(recs[0]["kind"], "dot")
             self.assertEqual(recs[0]["count"], 0)
 
@@ -1095,7 +1110,7 @@ class UnreadMarkerTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(SYSTEM_FFMPEG), "system ffmpeg missing")
         with tempfile.TemporaryDirectory(prefix="wechat-watch-unread-cli-") as td:
             png = os.path.join(td, "badge.png")
-            write_red_circle_png(png, 200, 100, cx=40, cy=36, radius=12, digit="5", fontsize=16)
+            write_red_circle_png(png, 200, 100, cx=175, cy=36, radius=12, digit="5", fontsize=16)
             proc = subprocess.run(
                 [
                     sys.executable,
@@ -1111,9 +1126,10 @@ class UnreadMarkerTests(unittest.TestCase):
             )
             parsed = _parse_unread_stdout(proc.stdout)
             self.assertIn("unread_rows", parsed, proc.stdout)
-            self.assertGreaterEqual(int(parsed["unread_rows"]), 1, proc.stdout)
+            self.assertEqual(int(parsed["unread_rows"]), 1, proc.stdout)
             self.assertEqual(parsed.get("unread0_kind"), "number", proc.stdout)
             self.assertEqual(parsed.get("unread0_count"), "5", proc.stdout)
+            self.assertEqual(parsed.get("unread0"), "5", proc.stdout)
             self.assertIn("unread0_x", parsed)
             self.assertIn("unread0_y", parsed)
             self.assertIn("unread0_w", parsed)
@@ -1126,6 +1142,142 @@ class UnreadMarkerTests(unittest.TestCase):
             write_solid_png(png, 200, 100, "white")
             recs = regions.detect_unread(png, PERSIST_FFMPEG)
             self.assertEqual(recs, [])
+
+    def test_avatar_red_is_not_unread(self):
+        self.assertTrue(os.path.isfile(SYSTEM_FFMPEG), "system ffmpeg missing")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-unread-av-") as td:
+            png = os.path.join(td, "avatar.png")
+            write_red_circle_png(png, 200, 100, cx=28, cy=40, radius=16, digit="7", fontsize=16)
+            recs = regions.detect_unread(png, PERSIST_FFMPEG)
+            self.assertEqual(recs, [])
+
+    def test_selected_row_highlight_is_not_unread(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-unread-hl-") as td:
+            png = os.path.join(td, "highlight.png")
+            write_box_png(png, 200, 80, (0, 8, 200, 64), color="0xE8E8E8", bg="white")
+            recs = regions.detect_unread(png, PERSIST_FFMPEG)
+            self.assertEqual(recs, [])
+
+    def test_unread_compact_tokens(self):
+        self.assertEqual(
+            regions.unread_line_token({"kind": "number", "count": 5}), "5"
+        )
+        self.assertEqual(
+            regions.unread_line_token({"kind": "dot", "count": 0}), "dot"
+        )
+        self.assertEqual(
+            regions.unread_line_token({"kind": "text", "count": 3}), "3"
+        )
+        self.assertEqual(
+            regions.unread_line_token({"kind": "text", "count": 0}), "0"
+        )
+        self.assertTrue(os.path.isfile(SYSTEM_FFMPEG), "system ffmpeg missing")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-unread-c-") as td:
+            five = os.path.join(td, "five.png")
+            write_red_circle_png(five, 200, 100, cx=175, cy=36, radius=12, digit="5", fontsize=16)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "--detect-unread",
+                    five,
+                    "--ffmpeg",
+                    PERSIST_FFMPEG,
+                    "--unread-compact",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            parsed = _parse_unread_stdout(proc.stdout)
+            self.assertEqual(parsed.get("unread_rows"), "1", proc.stdout)
+            self.assertEqual(parsed.get("unread0"), "5", proc.stdout)
+            self.assertNotIn("unread0_kind", parsed, proc.stdout)
+            self.assertNotIn("unread0_name", parsed, proc.stdout)
+
+            dot = os.path.join(td, "dot.png")
+            write_red_circle_png(dot, 200, 80, cx=175, cy=40, radius=4, digit=None)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "--detect-unread",
+                    dot,
+                    "--ffmpeg",
+                    PERSIST_FFMPEG,
+                    "--unread-compact",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            parsed = _parse_unread_stdout(proc.stdout)
+            self.assertEqual(parsed.get("unread_rows"), "1", proc.stdout)
+            self.assertEqual(parsed.get("unread0"), "dot", proc.stdout)
+
+            blank = os.path.join(td, "blank.png")
+            write_solid_png(blank, 200, 100, "white")
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "--detect-unread",
+                    blank,
+                    "--ffmpeg",
+                    PERSIST_FFMPEG,
+                    "--unread-compact",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            parsed = _parse_unread_stdout(proc.stdout)
+            self.assertEqual(parsed.get("unread_rows"), "0", proc.stdout)
+            self.assertNotIn("unread0", parsed, proc.stdout)
+            cheap = regions.detect_unread(five, PERSIST_FFMPEG, cheap=True)
+            self.assertEqual(len(cheap), 1, cheap)
+            self.assertEqual(cheap[0]["kind"], "number")
+            self.assertEqual(cheap[0]["count"], 5)
+            self.assertEqual(cheap[0].get("name") or "", "")
+
+    def test_diff_calls_unread_compact(self):
+        with open(os.path.join(ROOT, "wechat-watch-diff"), encoding="utf-8") as fh:
+            diff = fh.read()
+        self.assertIn("--detect-unread", diff)
+        self.assertIn("--unread-compact", diff)
+        self.assertNotIn("--cache-images", diff)
+        cheap = diff.split('if [ "$LIST_CHANGED" -eq 0 ]', 1)[1]
+        cheap_branch = cheap.split("fi", 1)[0]
+        self.assertIn('echo "UNCHANGED"', cheap_branch)
+        self.assertIn("exit 0", cheap_branch)
+        self.assertNotIn("--detect-unread", cheap_branch)
+        self.assertNotIn("--unread-compact", cheap_branch)
+        after = cheap.split("fi", 1)[1]
+        self.assertIn("--detect-unread", after)
+        self.assertIn("--unread-compact", after)
+        self.assertIn("UNREAD_OUT", after)
+        self.assertIn("flap=1", after)
+        self.assertIn('--detect-unread "$CROP"', after)
+        self.assertIn('--detect-unread "$PREV"', after)
+        self.assertIn("unread[0-9]", after)
+
+    def test_diff_unread_on_changed(self):
+        with open(os.path.join(ROOT, "wechat-watch-diff"), encoding="utf-8") as fh:
+            diff = fh.read()
+        self.assertIn("--detect-unread", diff)
+        self.assertIn("--unread-compact", diff)
+        self.assertNotIn("--cache-images", diff)
+        cheap = diff.split('if [ "$LIST_CHANGED" -eq 0 ]', 1)[1]
+        cheap_branch = cheap.split("fi", 1)[0]
+        self.assertNotIn("--detect-unread", cheap_branch)
+        after = cheap.split("fi", 1)[1]
+        self.assertIn('echo "CHANGED"', after)
+        self.assertIn("UNREAD_OUT", after)
+        self.assertIn('printf \'%s\\n\' "$UNREAD_OUT"', after)
+        # Badge-only: same text fingerprint, different unread tokens → CHANGED.
+        self.assertIn("UNREAD_SAME", after)
+        self.assertIn('--detect-unread "$PREV"', after)
+        self.assertIn("unread[0-9]", after)
 
 
 class NavIconTests(unittest.TestCase):
