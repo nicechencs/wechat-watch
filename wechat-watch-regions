@@ -3840,6 +3840,7 @@ def plan_private_send(
     sessions: list | None = None,
     win: tuple[int, int, int, int] | None = None,
     crops: dict | None = None,
+    already_open: bool = False,
 ) -> dict:
     """Pure plan: validate, match existing 1:1, locate input. No desktop I/O."""
     checked = validate_send(peer, text, username=username)
@@ -3858,7 +3859,7 @@ def plan_private_send(
     pane = crops or window_crops(*win_box)
     inp = input_box_point(win_box, pane)
     actions: list[dict] = []
-    if chosen is not None:
+    if chosen is not None and not already_open:
         row_pt = list_row_point(pane["list"], chosen)
         actions.append({"op": "focus-session", "x": row_pt[0], "y": row_pt[1]})
     actions.append({"op": "focus-input", "x": inp[0], "y": inp[1]})
@@ -3994,6 +3995,7 @@ def run_send(
     atspi_tree: str | None = None,
     atspi_extents: list | None = None,
     probe_window: bool = False,
+    already_open: bool = False,
 ) -> dict:
     checked = validate_send(peer, text, username=username)
     win, source = find_window(
@@ -4018,6 +4020,7 @@ def run_send(
             sessions=sess,
             win=win,
             crops=pane,
+            already_open=already_open,
         )
     else:
         if not dry_run:
@@ -4029,6 +4032,7 @@ def run_send(
             sessions=None,
             win=win,
             crops=pane,
+            already_open=already_open,
         )
     if dry_run:
         return {
@@ -4042,17 +4046,22 @@ def run_send(
     if driver is not None:
         execute_send_plan(plan, driver)
         return {'ok': True, 'peer': plan['peer'], 'text': plan['text']}
+    apply_plan = None
     apply = None
     try:
         here = os.path.dirname(os.path.abspath(__file__))
         if here not in sys.path:
             sys.path.insert(0, here)
+        from wechat_watch_apply import apply_send_plan as apply_plan
         from wechat_watch_apply import apply_private_text as apply
     except Exception:
+        apply_plan = None
         apply = None
-    if apply is None or not apply(plan['peer'], plan['text']):
-        raise SendRefused('no-input-driver', peer=plan['peer'], text=plan['text'])
-    return {'ok': True, 'peer': plan['peer'], 'text': plan['text']}
+    if apply_plan is not None and apply_plan(plan):
+        return {'ok': True, 'peer': plan['peer'], 'text': plan['text']}
+    if apply is not None and apply(plan['peer'], plan['text']):
+        return {'ok': True, 'peer': plan['peer'], 'text': plan['text']}
+    raise SendRefused('no-input-driver', peer=plan['peer'], text=plan['text'])
 
 def cli_send(args) -> int:
     peer = '' if args.peer is None else str(args.peer)

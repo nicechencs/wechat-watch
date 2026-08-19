@@ -2819,7 +2819,10 @@ class SendHelperTests(unittest.TestCase):
             self.assertEqual(ctx.exception.error, "group")
 
     def test_dry_run_never_calls_apply(self):
-        with patch("wechat_watch_apply.apply_private_text") as apply:
+        with patch("wechat_watch_apply.apply_send_plan") as geom, patch(
+            "wechat_watch_apply.apply_private_text"
+        ) as apply:
+            geom.return_value = True
             apply.return_value = True
             result = regions.run_send(
                 "阿坤",
@@ -2830,10 +2833,14 @@ class SendHelperTests(unittest.TestCase):
             )
             self.assertTrue(result["ok"])
             self.assertTrue(result.get("dry_run"))
+            geom.assert_not_called()
             apply.assert_not_called()
 
     def test_stub_apply_invoked_once(self):
-        with patch("wechat_watch_apply.apply_private_text") as apply:
+        with patch("wechat_watch_apply.apply_send_plan") as geom, patch(
+            "wechat_watch_apply.apply_private_text"
+        ) as apply:
+            geom.return_value = True
             apply.return_value = True
             result = regions.run_send(
                 "阿坤",
@@ -2845,6 +2852,38 @@ class SendHelperTests(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertEqual(result["peer"], "阿坤")
             self.assertEqual(result["text"], "好")
+            geom.assert_called_once()
+            apply.assert_not_called()
+
+    def test_already_open_skips_session_focus(self):
+        plan = regions.plan_private_send(
+            peer="阿坤",
+            text="好",
+            sessions=[{"name": "阿坤", "row": 1}],
+            win=(0, 0, 1280, 800),
+            already_open=True,
+        )
+        ops = [a["op"] for a in plan["actions"]]
+        self.assertNotIn("focus-session", ops)
+        self.assertEqual(ops[0], "focus-input")
+        self.assertIn("type", ops)
+        self.assertIn("submit", ops)
+
+    def test_geom_fail_falls_back_to_private_apply(self):
+        with patch("wechat_watch_apply.apply_send_plan") as geom, patch(
+            "wechat_watch_apply.apply_private_text"
+        ) as apply:
+            geom.return_value = False
+            apply.return_value = True
+            result = regions.run_send(
+                "阿坤",
+                "好",
+                sessions=[{"name": "阿坤", "row": 1}],
+                dry_run=False,
+                probe_window=False,
+            )
+            self.assertTrue(result["ok"])
+            geom.assert_called_once()
             apply.assert_called_once_with("阿坤", "好")
 
     def test_apply_source_submits_after_fill(self):

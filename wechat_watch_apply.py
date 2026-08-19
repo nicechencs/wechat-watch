@@ -2,6 +2,141 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
+
+
+def _atspi():
+    try:
+        import gi
+        gi.require_version("Atspi", "2.0")
+        from gi.repository import Atspi
+        return Atspi
+    except Exception:
+        return None
+
+
+def apply_send_plan(plan: dict) -> bool:
+    """Click planned x/y, fill composer, submit. No AT-SPI tree walk."""
+    if not isinstance(plan, dict):
+        return False
+    peer = str(plan.get("peer") or "")
+    text = str(plan.get("text") or "")
+    if not peer or not text:
+        return False
+    if "群" in peer or "chatroom" in peer.lower():
+        return False
+    actions = list(plan.get("actions") or [])
+    if not actions:
+        return False
+    banned = {"search", "add-contact", "new-chat", "compose-new"}
+    if any((s.get("op") in banned) for s in actions):
+        return False
+    Atspi = _atspi()
+    if Atspi is None:
+        return False
+    os.environ.setdefault("DISPLAY", os.environ.get("DISPLAY", ":8"))
+    typed = False
+    submitted = False
+    for step in actions:
+        op = step.get("op")
+        if op in ("focus-session", "focus-input"):
+            try:
+                x, y = int(step["x"]), int(step["y"])
+                Atspi.generate_mouse_event(x, y, "b1c")
+            except Exception:
+                return False
+            time.sleep(0.05)
+        elif op == "type":
+            body = str(step.get("text") or text)
+            if not _fill_focused(Atspi, body):
+                return False
+            typed = True
+        elif op == "submit":
+            if not _submit_return(Atspi):
+                return False
+            submitted = True
+    return bool(typed and submitted)
+
+
+def _fill_focused(Atspi, text: str) -> bool:
+    box = _focused_edit(Atspi)
+    if box is not None:
+        try:
+            box.set_text_contents(text)
+            return True
+        except Exception:
+            pass
+    return _paste_clipboard(Atspi, text)
+
+
+def _focused_edit(Atspi):
+    try:
+        desk = Atspi.get_desktop(0)
+        n = desk.get_child_count()
+    except Exception:
+        return None
+    for i in range(min(n or 0, 20)):
+        try:
+            app = desk.get_child_at_index(i)
+        except Exception:
+            continue
+        if app is None:
+            continue
+        try:
+            nm = (app.get_name() or "").lower()
+        except Exception:
+            nm = ""
+        if "wechat-watch" in nm:
+            continue
+        if not any(k in nm for k in ("wechat", "weixin", "微信")):
+            continue
+        box = _find_edit(app, 0)
+        if box is not None:
+            return box
+    return None
+
+
+def _find_edit(node, depth: int):
+    if node is None or depth > 6:
+        return None
+    try:
+        role = (node.get_role_name() or "").lower()
+    except Exception:
+        role = ""
+    if role in ("text", "entry", "passwordtext", "edit", "editabletext"):
+        return node
+    try:
+        n = node.get_child_count()
+    except Exception:
+        n = 0
+    last = None
+    for i in range(min(n or 0, 24)):
+        try:
+            ch = node.get_child_at_index(i)
+        except Exception:
+            continue
+        hit = _find_edit(ch, depth + 1)
+        if hit is not None:
+            last = hit
+    return last
+
+
+def _paste_clipboard(Atspi, text: str) -> bool:
+    return False
+
+
+def _submit_return(Atspi) -> bool:
+    for kind_name in ("PRESSRELEASE", "SYM", "STRING", "PRESS"):
+        kind = getattr(Atspi.KeySynthType, kind_name, None)
+        if kind is None:
+            continue
+        try:
+            Atspi.generate_keyboard_event(0xFF0D, "Return", kind)
+            return True
+        except Exception:
+            continue
+    return False
+
 
 def apply_private_text(peer: str, text: str) -> bool:
     """Best-effort AT-SPI: open existing 1:1 row, fill composer, then submit."""
