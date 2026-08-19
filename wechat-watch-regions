@@ -3626,7 +3626,7 @@ def _session_name(rec) -> str:
     if isinstance(rec, str):
         return rec
     if isinstance(rec, dict):
-        return str(rec.get("name") or rec.get("peer") or rec.get("title") or "")
+        return str(rec.get("name") or rec.get("display") or rec.get("peer") or rec.get("title") or "")
     return ""
 
 
@@ -3764,7 +3764,7 @@ def sessions_from_row_recs(recs: list) -> list[dict]:
             continue
         if not isinstance(rec, dict):
             continue
-        raw = str(rec.get("name") or rec.get("title") or rec.get("peer") or "")
+        raw = str(rec.get("name") or rec.get("display") or rec.get("title") or rec.get("peer") or "")
         name = parse_row_title(raw) or (normalize_nick(raw) or raw.strip())
         if not name or not is_plausible_nick(name):
             continue

@@ -2758,6 +2758,66 @@ class SendHelperTests(unittest.TestCase):
             self.assertFalse(rec["ok"])
             self.assertEqual(rec["error"], "group")
 
+    def test_cli_dry_run_match_wxcli_display_sessions(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "sessions.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "ok": True,
+                        "command": "chat.sessions",
+                        "sessions": [
+                            {
+                                "username": "wxid_0svgaau5drvs12",
+                                "display": "阿坤",
+                                "kind": "private",
+                            },
+                            {
+                                "username": "50240319502@chatroom",
+                                "display": "独立产品创业联盟3群",
+                                "kind": "group",
+                            },
+                            {
+                                "username": "filehelper",
+                                "display": "文件传输助手",
+                                "kind": "system",
+                            },
+                        ],
+                    },
+                    fh,
+                    ensure_ascii=False,
+                )
+            proc = self._cli(
+                [
+                    "--send",
+                    "--peer",
+                    "阿坤",
+                    "--username",
+                    "wxid_0svgaau5drvs12",
+                    "--text",
+                    "好",
+                    "--dry-run",
+                    "--sessions-json",
+                    path,
+                ]
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            rec = self._last_json(proc.stdout)
+            self.assertTrue(rec["ok"])
+            self.assertEqual(rec["peer"], "阿坤")
+            self.assertEqual(rec["text"], "好")
+            self.assertNotIn("error", rec)
+
+            recs = regions.load_sessions_json(path)
+            names = {r.get("name") for r in recs}
+            self.assertIn("阿坤", names)
+            hit = regions.match_peer("阿坤", recs)
+            self.assertEqual(hit["name"], "阿坤")
+            self.assertEqual(hit.get("username"), "wxid_0svgaau5drvs12")
+            with self.assertRaises(regions.SendRefused) as ctx:
+                regions.match_peer("独立产品创业联盟3群", recs)
+            self.assertEqual(ctx.exception.error, "group")
+
     def test_dry_run_never_calls_apply(self):
         with patch("wechat_watch_apply.apply_private_text") as apply:
             apply.return_value = True
