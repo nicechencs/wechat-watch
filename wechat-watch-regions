@@ -31,6 +31,8 @@ Usage:
       # win/nav/list/thread + source= + id=; PNG scans gutters inside the window
   wechat-watch-regions --fingerprint TEXT
   wechat-watch-regions --fingerprint-json regions.json
+  wechat-watch-regions --normalize-nick RAW
+      # print nick= and ok=0|1; no PNG
 """
 from __future__ import annotations
 
@@ -435,21 +437,137 @@ def is_cjk(ch: str) -> bool:
     return any(lo <= o <= hi for lo, hi in _CJK_RANGES)
 
 
+# Long tesseract noise runs dumped into nick / session OCR.
+_NICK_JUNK_RUN = re.compile(r"[|/\\~`']{2,}")
+# Small set kept in nicks; | / ~-runs / ` / ' are stripped as junk, not names.
+_NICK_PUNCT = frozenset("·._-*~（）()【】[]!?，。、:：#@＋+")
+
+
+def is_emoji_like(ch: str) -> bool:
+    """True for emoji / pictographs / ZWJ sequences leftover in a nick."""
+    o = ord(ch)
+    if o in (0x200D, 0x20E3, 0xFE0E, 0xFE0F):
+        return True
+    return (
+        0x1F1E6 <= o <= 0x1F1FF
+        or 0x1F300 <= o <= 0x1FAFF
+        or 0x1F000 <= o <= 0x1F02F
+        or 0x1F0A0 <= o <= 0x1F0FF
+        or 0x2300 <= o <= 0x23FF
+        or 0x2600 <= o <= 0x27BF
+        or 0x2B50 <= o <= 0x2B55
+        or o in (0x3030, 0x303D, 0x3297, 0x3299)
+    )
+
+
+def _is_ascii_letter(ch: str) -> bool:
+    return "A" <= ch <= "Z" or "a" <= ch <= "z"
+
+
+def _keep_nick_char(ch: str) -> bool:
+    if ch == " ":
+        return True
+    if is_cjk(ch) or ch.isalnum() or is_emoji_like(ch):
+        return True
+    return ch in _NICK_PUNCT
+
+
+def _drop_isolated_latin_near_cjk(s: str) -> str:
+    """Drop a single ASCII letter sitting next to CJK (tesseract noise)."""
+    chars = list(s)
+    n = len(chars)
+    drop = [False] * n
+    i = 0
+    while i < n:
+        if not _is_ascii_letter(chars[i]):
+            i += 1
+            continue
+        j = i + 1
+        while j < n and _is_ascii_letter(chars[j]):
+            j += 1
+        if j - i == 1:
+            left = i - 1
+            while left >= 0 and chars[left] == " ":
+                left -= 1
+            right = j
+            while right < n and chars[right] == " ":
+                right += 1
+            near_cjk = (left >= 0 and is_cjk(chars[left])) or (
+                right < n and is_cjk(chars[right])
+            )
+            if near_cjk:
+                drop[i] = True
+        i = j
+    cleaned = "".join(ch for ch, gone in zip(chars, drop) if not gone)
+    return " ".join(cleaned.split())
+
+
+def normalize_nick(raw: str) -> str:
+    """Strip, collapse whitespace, drop tesseract junk; keep CJK / alnum / emoji.
+
+    Isolated Latin next to CJK is dropped (CJK stays). Empty after clean → "".
+    """
+    if not raw:
+        return ""
+    text = _NICK_JUNK_RUN.sub("", raw)
+    text = " ".join(text.split())
+    if not text:
+        return ""
+    text = "".join(ch for ch in text if _keep_nick_char(ch))
+    text = " ".join(text.split())
+    if not text:
+        return ""
+    return _drop_isolated_latin_near_cjk(text)
+
+
+def is_plausible_nick(s: str) -> bool:
+    """True if 1+ CJK or 2+ alnum or a leftover emoji-like token; else False."""
+    nick = normalize_nick(s)
+    if not nick:
+        return False
+    n_cjk = 0
+    n_alnum = 0
+    n_emoji = 0
+    for ch in nick:
+        if is_cjk(ch):
+            n_cjk += 1
+        elif ch.isalnum():
+            n_alnum += 1
+        elif is_emoji_like(ch):
+            n_emoji += 1
+    if n_cjk >= 1 or n_alnum >= 2 or n_emoji >= 1:
+        return True
+    return False
+
+
 def classify_ocr(raw: str) -> tuple[str, str]:
-    """Return (kind, text). TEXT needs 1 CJK or 2+ alnum after strip."""
+    """Return (kind, text). TEXT needs 1 CJK or 2+ alnum after strip.
+
+    Short leftovers (session names / nicks) go through normalize_nick so
+    tesseract junk is not published as a name; implausible → kind=image.
+    """
     text = (raw or "").strip()
     if len(text) < 1:
         return "image", ""
     n_cjk = 0
     n_alnum = 0
+    n_emoji = 0
     for ch in text:
         if is_cjk(ch):
             n_cjk += 1
         elif ch.isalnum():
             n_alnum += 1
-    if n_cjk >= 1 or n_alnum >= 2:
-        return "text", text
-    return "image", ""
+        elif is_emoji_like(ch):
+            n_emoji += 1
+    if not (n_cjk >= 1 or n_alnum >= 2 or n_emoji >= 1):
+        return "image", ""
+    # List-row / nick-sized OCR: clean junk; empty / punct-only stays image.
+    if len(text) <= NICK_MAX_CHARS * 2:
+        nick = normalize_nick(text)
+        if is_plausible_nick(nick):
+            return "text", nick
+        return "image", ""
+    return "text", text
 
 
 def find_tesseract() -> str:
@@ -942,15 +1060,12 @@ def nickname_box(
 
 
 def parse_nickname(raw: str) -> str:
-    if not raw:
+    nick = normalize_nick(raw or "")
+    if not is_plausible_nick(nick):
         return ""
-    text = raw.strip().splitlines()[0].strip()
-    if not text or len(text) > NICK_MAX_CHARS:
-        return ""
-    kind, cleaned = classify_ocr(text)
-    if kind != "text":
-        return ""
-    return cleaned
+    if len(nick) > NICK_MAX_CHARS:
+        nick = nick[:NICK_MAX_CHARS]
+    return nick
 
 
 def list_frame_pngs(frames_dir: str) -> list[str]:
@@ -1029,9 +1144,10 @@ def parse_frame_events(
                             pass
                 nick_path = os.path.join(td, f"nick{i}.png")
                 try:
-                    crop_png(ffmpeg, curr_path, nick_path, nickname_box(box, w, h))
-                    nick_raw, _k = ocr_png(
-                        nick_path, nickname_box(box, w, h)
+                    nb = nickname_box(box, w, h)
+                    crop_png(ffmpeg, curr_path, nick_path, nb)
+                    nick_raw = run_tesseract(
+                        nick_path, pick_psm(nb), lang="chi_sim+eng"
                     )
                     name = parse_nickname(nick_raw)
                 except (OSError, subprocess.CalledProcessError):
@@ -1493,10 +1609,10 @@ def parse_row_title(raw: str) -> str:
         return ""
     line = raw.strip().splitlines()[0].strip()
     line = re.sub(r"\s+\d{1,2}:\d{2}\s*$", "", line)
-    kind, text = classify_ocr(line)
-    if kind == "text":
-        return text[:NICK_MAX_CHARS]
-    return ""
+    nick = normalize_nick(line)
+    if not is_plausible_nick(nick):
+        return ""
+    return nick[:NICK_MAX_CHARS]
 
 
 def ocr_row_title(
@@ -1518,8 +1634,8 @@ def ocr_row_title(
         crop_png(ffmpeg, src, dest, (nx, ny, nw, nh))
     except (OSError, subprocess.CalledProcessError):
         return ""
-    text, _kind = ocr_png(dest, (nx, ny, nw, nh))
-    return parse_row_title(text)
+    raw = run_tesseract(dest, pick_psm((nx, ny, nw, nh)), lang="chi_sim+eng")
+    return parse_row_title(raw)
 
 
 def _unread_rec(
@@ -3448,7 +3564,18 @@ def main() -> int:
         metavar="regions.json",
         help="print list-text fingerprint of text0 / first record",
     )
+    p.add_argument(
+        "--normalize-nick",
+        metavar="RAW",
+        help="normalize a nickname/session name; print nick= and ok=0|1 (no PNG)",
+    )
     args = p.parse_args()
+
+    if args.normalize_nick is not None:
+        nick = normalize_nick(args.normalize_nick)
+        print(f"nick={nick}")
+        print(f"ok={1 if is_plausible_nick(nick) else 0}")
+        return 0
 
     if args.fingerprint is not None:
         print(list_text_fingerprint(args.fingerprint))
@@ -3618,7 +3745,7 @@ def main() -> int:
         return 0
 
     if not args.prev or not args.curr:
-        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread / --detect-nav / --cache-images / --classify / --detect-time / --window-geom / --fingerprint / --fingerprint-json")
+        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread / --detect-nav / --cache-images / --classify / --detect-time / --window-geom / --fingerprint / --fingerprint-json / --normalize-nick")
     if not args.out_dir or not args.json:
         p.error("--out-dir and --json are required unless --detect-scroll / --parse-frames / --should-record")
 

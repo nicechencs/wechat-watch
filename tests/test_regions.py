@@ -2196,5 +2196,64 @@ class TimeDividerTests(unittest.TestCase):
         self.assertNotIn("detect_time_dividers", src)
 
 
+class NickRobustTests(unittest.TestCase):
+    """Nickname / session-name: empty, tesseract junk, emoji leftovers."""
+
+    def test_normalize_cjk_stripped_is_plausible(self):
+        self.assertEqual(regions.normalize_nick("  陈  "), "陈")
+        self.assertTrue(regions.is_plausible_nick("  陈  "))
+        self.assertTrue(regions.is_plausible_nick("陈"))
+
+    def test_tess_junk_empty_not_plausible(self):
+        self.assertEqual(regions.normalize_nick("|||~~~"), "")
+        self.assertFalse(regions.is_plausible_nick("|||~~~"))
+        self.assertFalse(regions.is_plausible_nick(""))
+        self.assertFalse(regions.is_plausible_nick("A"))
+        self.assertFalse(regions.is_plausible_nick("...!!!"))
+
+    def test_cjk_with_emoji_keeps_cjk(self):
+        nick = regions.normalize_nick("阿坤\n😀")
+        self.assertIn("阿坤", nick)
+        self.assertTrue(regions.is_plausible_nick("阿坤\n😀"))
+        self.assertTrue(regions.is_plausible_nick(nick))
+
+    def test_parse_nickname_and_row_title_drop_garbage(self):
+        self.assertEqual(regions.parse_nickname("|||陈|||"), "陈")
+        self.assertEqual(regions.parse_nickname("|||~~~"), "")
+        self.assertEqual(regions.parse_row_title("  陈  12:03"), "陈")
+        self.assertEqual(regions.parse_row_title("|||~~~"), "")
+        self.assertEqual(regions.parse_nickname("😀"), "😀")
+        self.assertTrue(regions.is_plausible_nick("😀"))
+
+    def test_cli_normalize_nick(self):
+        proc = subprocess.run(
+            [sys.executable, SCRIPT, "--normalize-nick", "陈"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn("nick=陈", proc.stdout)
+        self.assertIn("ok=1", proc.stdout)
+        junk = subprocess.run(
+            [sys.executable, SCRIPT, "--normalize-nick", "|||~~~"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn("nick=", junk.stdout)
+        self.assertIn("ok=0", junk.stdout)
+        self.assertNotIn("ERROR", junk.stderr)
+
+    def test_cli_missing_args_keeps_error_style(self):
+        proc = subprocess.run(
+            [sys.executable, SCRIPT],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--normalize-nick", proc.stderr)
+        self.assertIn("required unless", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

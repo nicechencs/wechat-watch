@@ -191,6 +191,9 @@ kind1=image
 # 对话区时间/日期分隔条（居中灰条：今天 16:04 / 昨天 / 年月日）。像素先找细条，只 OCR 那些框，不扫整页。不进 10 秒轮询。
 ./wechat-watch-regions --detect-time thread.png
 
+# 会话名 / 群昵称清洗（空昵称、OCR 噪点、残留表情），不需要 PNG
+./wechat-watch-regions --normalize-nick "陈"
+
 # 当前微信窗口矩形 + nav/list/thread 裁剪（找不到则 1280x800 常量）
 ./wechat-watch-regions --window-geom
 # 有窗口截图时扫描 gutter，list/thread 跟分隔线而不是固定 63/282
@@ -245,6 +248,7 @@ unread0_name=独立产品创业
 - 排版：普通块 `--psm 6`，短条 / 徽章状 `--psm 7`（按框尺寸判断，不以 x=0 当徽章）
 - `kind=text`：去掉空白后，至少 1 个汉字，或至少 2 个字母数字
 - `kind=image`：空、纯空白、或只有标点（照片、空白、图标）
+- 会话名 / 群昵称走 `normalize_nick`：去掉空白和常见 OCR 噪点（`|||` `~~~`），空昵称或纯符号不当名字；汉字、字母数字、少量表情可保留。短垃圾不当 `text`。可用 `--normalize-nick` 单独检查（`nick=` / `ok=0|1`）
 - `UNCHANGED` 不会跑 OCR（除非正在翻历史、已经开始解析录像帧）
 
 语言包优先读 `$WECHAT_PERSIST/tessdata`（`TESSDATA_PREFIX`）。reset 后可用 `ensure-wechat` 按 `apt-deps.txt` 把 tesseract 装回来。
@@ -255,7 +259,7 @@ unread0_name=独立产品创业
 python3 tests/test_regions.py
 ```
 
-当前覆盖：假色块切框、徽章保留、大面积变化回退、中英 OCR、CLI 的 `textN=` / `kindN=`、thread 尺寸切框、左右气泡 → `in`/`out`、滚动检测、列表变化不录像、头像 average-hash、identities 绑定、时间线 JSON、`wechat-watch-gc` 过期删除、UTC/Asia/Shanghai 双时区、`wechat-watch-thread --png` 只读 OCR、左侧未读标记（红数字 / 红点 / `[N条]`）、窗口 gutter 扫描（移动 vs 缩放 / DPI）、窗口 id 解析、列表 text0 指纹 / flap、注入式 AT-SPI 探测、image-bubble read-only cache / `--cache-images`、像素先分类 / `--classify`、时间分隔条 / `--detect-time`。
+当前覆盖：假色块切框、徽章保留、大面积变化回退、中英 OCR、CLI 的 `textN=` / `kindN=`、thread 尺寸切框、左右气泡 → `in`/`out`、滚动检测、列表变化不录像、头像 average-hash、identities 绑定、时间线 JSON、`wechat-watch-gc` 过期删除、UTC/Asia/Shanghai 双时区、`wechat-watch-thread --png` 只读 OCR、左侧未读标记（红数字 / 红点 / `[N条]`）、窗口 gutter 扫描（移动 vs 缩放 / DPI）、窗口 id 解析、列表 text0 指纹 / flap、注入式 AT-SPI 探测、image-bubble read-only cache / `--cache-images`、像素先分类 / `--classify`、时间分隔条 / `--detect-time`、会话名 / 昵称 `normalize_nick`。
 
 ## 运行时文件（不进 git）
 
