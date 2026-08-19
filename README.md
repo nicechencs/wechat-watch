@@ -185,6 +185,9 @@ kind1=image
 # 对话区图片气泡（只读缓存到本地 persist，不会上传、不会发送；不进 10 秒轮询，不自动放大）
 ./wechat-watch-regions --cache-images thread.png --images-dir "$WECHAT_PERSIST/watch/images"
 
+# 像素先分类（UIED 顺序：梯度 / 去细线 / 大框内再切 / 分类后再 OCR），本地 stdlib，无 OpenCV。不进 10 秒轮询。
+./wechat-watch-regions --classify thread.png
+
 # 当前微信窗口矩形 + nav/list/thread 裁剪（找不到则 1280x800 常量）
 ./wechat-watch-regions --window-geom
 # 有窗口截图时扫描 gutter，list/thread 跟分隔线而不是固定 63/282
@@ -249,7 +252,7 @@ unread0_name=独立产品创业
 python3 tests/test_regions.py
 ```
 
-当前覆盖：假色块切框、徽章保留、大面积变化回退、中英 OCR、CLI 的 `textN=` / `kindN=`、thread 尺寸切框、左右气泡 → `in`/`out`、滚动检测、列表变化不录像、头像 average-hash、identities 绑定、时间线 JSON、`wechat-watch-gc` 过期删除、UTC/Asia/Shanghai 双时区、`wechat-watch-thread --png` 只读 OCR、左侧未读标记（红数字 / 红点 / `[N条]`）、窗口 gutter 扫描（移动 vs 缩放 / DPI）、窗口 id 解析、列表 text0 指纹 / flap、注入式 AT-SPI 探测、image-bubble read-only cache / `--cache-images`。
+当前覆盖：假色块切框、徽章保留、大面积变化回退、中英 OCR、CLI 的 `textN=` / `kindN=`、thread 尺寸切框、左右气泡 → `in`/`out`、滚动检测、列表变化不录像、头像 average-hash、identities 绑定、时间线 JSON、`wechat-watch-gc` 过期删除、UTC/Asia/Shanghai 双时区、`wechat-watch-thread --png` 只读 OCR、左侧未读标记（红数字 / 红点 / `[N条]`）、窗口 gutter 扫描（移动 vs 缩放 / DPI）、窗口 id 解析、列表 text0 指纹 / flap、注入式 AT-SPI 探测、image-bubble read-only cache / `--cache-images`、像素先分类 / `--classify`。
 
 ## 运行时文件（不进 git）
 

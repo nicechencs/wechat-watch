@@ -1901,5 +1901,171 @@ class ImageCacheTests(unittest.TestCase):
         self.assertNotIn("--cache-images", src)
 
 
+class ClassifyRegionTests(unittest.TestCase):
+    """UIED-inspired pixel-first classify: image / text / line / chrome. No OCR."""
+
+    def test_classify_region_line_and_solid_teal_units(self):
+        w, h = 400, 200
+        rgb = bytes([255, 255, 255] * (w * h))
+        self.assertEqual(regions.classify_region(rgb, w, h, (10, 90, 380, 2)), "line")
+        self.assertEqual(regions.classify_region(rgb, w, h, (0, 0, 2, 400)), "line")
+
+        fw, fh = 720, 400
+        buf = bytearray([255, 255, 255] * (fw * fh))
+        # 0x0A6E80 teal block at (80,40,200,160)
+        for yy in range(40, 200):
+            for xx in range(80, 280):
+                o = (yy * fw + xx) * 3
+                buf[o] = 0x0A
+                buf[o + 1] = 0x6E
+                buf[o + 2] = 0x80
+        self.assertEqual(
+            regions.classify_region(bytes(buf), fw, fh, (80, 40, 200, 160)),
+            "image",
+        )
+
+    def test_image_and_text_detect_and_classify_and_cli(self):
+        self.assertTrue(os.path.isfile(PERSIST_FFMPEG), "persist ffmpeg missing")
+        self.assertTrue(os.path.isfile(CJK_FONT), f"missing CJK font: {CJK_FONT}")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-cls-") as td:
+            thread = os.path.join(td, "thread.png")
+            write_image_and_text_png(thread)
+            w, h = regions.png_size(thread)
+            rgb = regions.decode_rgb24(
+                PERSIST_FFMPEG, thread, w, h, os.path.join(td, "t.rgb")
+            )
+            recs = regions.detect_and_classify(rgb, w, h)
+            kinds = [r["kind"] for r in recs]
+            self.assertIn("image", kinds, recs)
+            self.assertIn("text", kinds, recs)
+            self.assertEqual(
+                regions.classify_region(rgb, w, h, (80, 40, 200, 160)),
+                "image",
+            )
+            text_boxes = [r["box"] for r in recs if r["kind"] == "text"]
+            self.assertTrue(text_boxes, recs)
+            self.assertEqual(
+                regions.classify_region(rgb, w, h, text_boxes[0]),
+                "text",
+            )
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "--classify",
+                    thread,
+                    "--ffmpeg",
+                    PERSIST_FFMPEG,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("kind=image", proc.stdout)
+            self.assertIn("kind=text", proc.stdout)
+            parsed = _parse_unread_stdout(proc.stdout)
+            n = int(parsed.get("regions", "0"))
+            self.assertGreaterEqual(n, 2, proc.stdout)
+            self.assertTrue(
+                any(ln.startswith("kind0=") for ln in proc.stdout.splitlines()),
+                proc.stdout,
+            )
+
+    def test_thin_full_width_line_is_line_not_image(self):
+        self.assertTrue(os.path.isfile(PERSIST_FFMPEG), "persist ffmpeg missing")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-cls-line-") as td:
+            path = os.path.join(td, "line.png")
+            write_box_png(path, 400, 200, (10, 90, 380, 2), color="black", bg="white")
+            w, h = regions.png_size(path)
+            rgb = regions.decode_rgb24(
+                PERSIST_FFMPEG, path, w, h, os.path.join(td, "t.rgb")
+            )
+            recs = regions.detect_and_classify(rgb, w, h)
+            kinds = [r["kind"] for r in recs]
+            self.assertIn("line", kinds, recs)
+            self.assertNotIn("image", kinds, recs)
+            self.assertEqual(
+                regions.classify_region(rgb, w, h, (10, 90, 380, 2)),
+                "line",
+            )
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "--classify",
+                    path,
+                    "--ffmpeg",
+                    PERSIST_FFMPEG,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            kind_lines = [
+                ln for ln in proc.stdout.splitlines() if ln.startswith("kind")
+            ]
+            self.assertTrue(
+                any(ln.endswith("=line") for ln in kind_lines),
+                proc.stdout,
+            )
+            self.assertFalse(
+                any(ln.endswith("=image") for ln in kind_lines),
+                proc.stdout,
+            )
+
+    def test_cache_images_synthetic_still_one_png(self):
+        self.assertTrue(os.path.isfile(PERSIST_FFMPEG), "persist ffmpeg missing")
+        self.assertTrue(os.path.isfile(CJK_FONT), f"missing CJK font: {CJK_FONT}")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-cls-cache-") as td:
+            thread = os.path.join(td, "thread.png")
+            images_dir = os.path.join(td, "images")
+            write_image_and_text_png(thread)
+            recs = regions.cache_images(thread, images_dir, PERSIST_FFMPEG)
+            pngs = [n for n in os.listdir(images_dir) if n.endswith(".png")]
+            self.assertEqual(len(recs), 1, recs)
+            self.assertEqual(len(pngs), 1, pngs)
+            recs2 = regions.cache_images(thread, images_dir, PERSIST_FFMPEG)
+            pngs2 = [n for n in os.listdir(images_dir) if n.endswith(".png")]
+            self.assertEqual(len(recs2), 1, recs2)
+            self.assertEqual(len(pngs2), 1, pngs2)
+
+    def test_docs_mention_classify_pixel_first(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+            readme = fh.read()
+        self.assertIn("--classify", readme)
+        self.assertIn("--detect-unread", readme)
+        self.assertIn("--detect-nav", readme)
+        self.assertIn("--cache-images", readme)
+        folded = readme.lower()
+        self.assertTrue(
+            "uied" in folded
+            or "pixel-first" in folded
+            or "像素优先" in readme
+            or "像素先" in readme
+            or "梯度" in readme,
+            "README must mention UIED / pixel-first / 像素 / 梯度",
+        )
+
+    def test_cli_classify_missing_png_exits_2(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                SCRIPT,
+                "--classify",
+                "/no/such/thread.png",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("ERROR", proc.stderr)
+
+    def test_diff_does_not_call_classify(self):
+        with open(os.path.join(ROOT, "wechat-watch-diff"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertNotIn("--classify", src)
+        self.assertNotIn("classify_region", src)
+
+
 if __name__ == "__main__":
     unittest.main()

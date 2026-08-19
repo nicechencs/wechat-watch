@@ -25,6 +25,7 @@ Usage:
   wechat-watch-regions --detect-nav NAV.png       # left-nav icon badges (read-only)
   wechat-watch-regions --cache-images THREAD.png [--images-dir DIR]
       # read-only image-bubble crops; local persist only, never sent
+  wechat-watch-regions --classify THREAD.png
   wechat-watch-regions --window-geom [--window-png WIN.png]
       # win/nav/list/thread + source= + id=; PNG scans gutters inside the window
   wechat-watch-regions --fingerprint TEXT
@@ -155,6 +156,22 @@ IMAGE_MAX_FRAME_FRAC = 0.85
 IMAGE_PAD = 4
 IMAGE_MERGE_GAP = MERGE_GAP
 IMAGE_MAX_ASPECT = 8.0
+
+# UIED-inspired pixel-first classify (stdlib rgb24; no OpenCV).
+GRAD_MIN = 8
+LINE_RATIO = 0.9
+LINE_THICK = 4
+NEST_MIN_H = 50
+NEST_INSET = 3
+NEST_CHILD_MIN_SIDE = 12
+NEST_COLOR_DELTA = 24
+CLASSIFY_MIN_AREA = 80
+CLASSIFY_MAX_ASPECT = 28.0
+CLASSIFY_MAX_H_FRAC = 0.80
+CLASSIFY_VAR_HIGH = 150.0
+CLASSIFY_SOLID_VAR = 220.0
+CLASSIFY_FILL_IMAGE = 0.38
+CLASSIFY_LINE_ASPECT = 8.0
 
 # CJK Unified Ideographs + common extensions / compatibility (not punctuation).
 _CJK_RANGES = (
@@ -2601,6 +2618,392 @@ def detect_image_boxes(rgb: bytes, w: int, h: int) -> list[tuple[int, int, int, 
     return out
 
 
+def luma_at(rgb: bytes, w: int, x: int, y: int) -> int:
+    o = (y * w + x) * 3
+    return (rgb[o] * 30 + rgb[o + 1] * 59 + rgb[o + 2] * 11) // 100
+
+
+def gradient_mask(
+    rgb: bytes, w: int, h: int, min_grad: int = GRAD_MIN
+) -> bytearray:
+    """|dx|+|dy| luma gradient; mask[i]=1 if grad >= min_grad (UIED-style edges)."""
+    n = w * h
+    mask = bytearray(n)
+    if w <= 0 or h <= 0 or not rgb:
+        return mask
+    for y in range(h):
+        row = y * w
+        y2 = y if y == h - 1 else y + 1
+        for x in range(w):
+            x2 = x if x == w - 1 else x + 1
+            c = luma_at(rgb, w, x, y)
+            dx = abs(luma_at(rgb, w, x2, y) - c)
+            dy = abs(luma_at(rgb, w, x, y2) - c)
+            if dx + dy >= min_grad:
+                mask[row + x] = 1
+    return mask
+
+
+def majority3(mask: bytearray, w: int, h: int) -> bytearray:
+    """3x3 majority: pixel stays on if >=5 of 9 neighbors (including self) are on."""
+    out = bytearray(w * h)
+    for y in range(h):
+        y0 = 0 if y == 0 else y - 1
+        y1 = h - 1 if y == h - 1 else y + 1
+        row = y * w
+        for x in range(w):
+            x0 = 0 if x == 0 else x - 1
+            x1 = w - 1 if x == w - 1 else x + 1
+            on = 0
+            for ny in range(y0, y1 + 1):
+                nrow = ny * w
+                for nx in range(x0, x1 + 1):
+                    on += mask[nrow + nx]
+            if on >= 5:
+                out[row + x] = 1
+    return out
+
+
+def rm_line(mask: bytearray, w: int, h: int) -> bytearray:
+    """Zero thin rows/cols that are mostly on (scrollbars, date dividers, gutters)."""
+    out = bytearray(mask)
+    if w <= 0 or h <= 0:
+        return out
+    row_mark = [False] * h
+    for y in range(h):
+        on = 0
+        row = y * w
+        for x in range(w):
+            on += mask[row + x]
+        if on / w > LINE_RATIO:
+            row_mark[y] = True
+    y = 0
+    while y < h:
+        if not row_mark[y]:
+            y += 1
+            continue
+        y1 = y + 1
+        while y1 < h and row_mark[y1]:
+            y1 += 1
+        if y1 - y <= LINE_THICK:
+            for yy in range(y, y1):
+                row = yy * w
+                for x in range(w):
+                    out[row + x] = 0
+        y = y1
+    col_mark = [False] * w
+    for x in range(w):
+        on = 0
+        for y in range(h):
+            on += out[y * w + x]
+        if on / h > LINE_RATIO:
+            col_mark[x] = True
+    x = 0
+    while x < w:
+        if not col_mark[x]:
+            x += 1
+            continue
+        x1 = x + 1
+        while x1 < w and col_mark[x1]:
+            x1 += 1
+        if x1 - x <= LINE_THICK:
+            for xx in range(x, x1):
+                for y in range(h):
+                    out[y * w + xx] = 0
+        x = x1
+    return out
+
+
+def _is_line_box(box: tuple[int, int, int, int], w: int, h: int) -> bool:
+    _x, _y, bw, bh = box
+    if bw <= 0 or bh <= 0:
+        return False
+    shorter = min(bw, bh)
+    longer = max(bw, bh)
+    if shorter <= LINE_THICK + 2 and longer / max(1, shorter) >= CLASSIFY_LINE_ASPECT:
+        return True
+    bar = max(8, LINE_THICK * 2)
+    if w > 0 and bw >= 0.7 * w and bh <= bar:
+        return True
+    if h > 0 and bh >= 0.7 * h and bw <= bar:
+        return True
+    return False
+
+
+def _box_iou(
+    a: tuple[int, int, int, int], b: tuple[int, int, int, int]
+) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x1 = max(ax, bx)
+    y1 = max(ay, by)
+    x2 = min(ax + aw, bx + bw)
+    y2 = min(ay + ah, by + bh)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    inter = (x2 - x1) * (y2 - y1)
+    union = aw * ah + bw * bh - inter
+    return inter / union if union else 0.0
+
+
+def _filter_classify_boxes(
+    boxes: list[tuple[int, int, int, int]], w: int, h: int
+) -> list[tuple[int, int, int, int]]:
+    frame_area = float(w * h) if w and h else 1.0
+    out: list[tuple[int, int, int, int]] = []
+    for box in boxes:
+        _x, _y, bw, bh = box
+        if bw * bh < CLASSIFY_MIN_AREA:
+            continue
+        if h > 0 and bh > CLASSIFY_MAX_H_FRAC * h:
+            continue
+        if bw >= int(w * 0.92) and bh >= int(h * 0.92):
+            continue
+        if (bw * bh) > 0.85 * frame_area:
+            continue
+        shorter = min(bw, bh)
+        longer = max(bw, bh)
+        if shorter > 0 and longer / shorter > CLASSIFY_MAX_ASPECT:
+            continue
+        out.append(box)
+    return out
+
+
+def _box_stats(
+    rgb: bytes,
+    w: int,
+    h: int,
+    box: tuple[int, int, int, int],
+    bg: tuple[int, int, int],
+) -> tuple[float, tuple[int, int, int], float, int]:
+    """Return (luma_var, mean_rgb, fill_vs_bg, n)."""
+    x, y, bw, bh = box
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(w, x + bw)
+    y1 = min(h, y + bh)
+    br, bgc, bb = bg
+    n = 0
+    s = 0
+    s2 = 0
+    tr = tg = tb = 0
+    fill = 0
+    for yy in range(y0, y1):
+        row = yy * w * 3
+        for xx in range(x0, x1):
+            o = row + xx * 3
+            r, g, b = rgb[o], rgb[o + 1], rgb[o + 2]
+            lum = (r * 30 + g * 59 + b * 11) // 100
+            s += lum
+            s2 += lum * lum
+            tr += r
+            tg += g
+            tb += b
+            if (
+                abs(r - br) > THRESH
+                or abs(g - bgc) > THRESH
+                or abs(b - bb) > THRESH
+            ):
+                fill += 1
+            n += 1
+    if n <= 0:
+        return 0.0, (0, 0, 0), 0.0, 0
+    mean = s / n
+    var = s2 / n - mean * mean
+    if var < 0:
+        var = 0.0
+    return var, (tr // n, tg // n, tb // n), fill / n, n
+
+
+def _nested_children(
+    rgb: bytes, w: int, h: int, box: tuple[int, int, int, int]
+) -> list[tuple[int, int, int, int]]:
+    """Smaller rectangles inside a large box (UIED nested inspect)."""
+    x, y, bw, bh = box
+    inset = NEST_INSET
+    if bw < 2 * inset + 16 or bh < 2 * inset + 16:
+        return []
+    ix = x + inset
+    iy = y + inset
+    iw = bw - 2 * inset
+    ih = bh - 2 * inset
+    if iw <= 0 or ih <= 0:
+        return []
+    tr = tg = tb = 0
+    n = 0
+    x1 = min(w, ix + iw)
+    y1 = min(h, iy + ih)
+    ix = max(0, ix)
+    iy = max(0, iy)
+    iw = x1 - ix
+    ih = y1 - iy
+    if iw <= 0 or ih <= 0:
+        return []
+    for yy in range(iy, y1):
+        row = yy * w * 3
+        for xx in range(ix, x1):
+            o = row + xx * 3
+            tr += rgb[o]
+            tg += rgb[o + 1]
+            tb += rgb[o + 2]
+            n += 1
+    if n <= 0:
+        return []
+    dr, dg, db = tr // n, tg // n, tb // n
+    local = bytearray(iw * ih)
+    nest_grad = GRAD_MIN + 6
+    for yy in range(iy, y1):
+        ly = yy - iy
+        for xx in range(ix, x1):
+            o = (yy * w + xx) * 3
+            r, g, b = rgb[o], rgb[o + 1], rgb[o + 2]
+            color_hit = (
+                abs(r - dr) > NEST_COLOR_DELTA
+                or abs(g - dg) > NEST_COLOR_DELTA
+                or abs(b - db) > NEST_COLOR_DELTA
+            )
+            grad_hit = False
+            if not color_hit:
+                c = (r * 30 + g * 59 + b * 11) // 100
+                x2 = xx if xx >= w - 1 else xx + 1
+                y2 = yy if yy >= h - 1 else yy + 1
+                dx = abs(luma_at(rgb, w, x2, yy) - c)
+                dy = abs(luma_at(rgb, w, xx, y2) - c)
+                grad_hit = (dx + dy) >= nest_grad
+            if color_hit or grad_hit:
+                local[ly * iw + (xx - ix)] = 1
+    local = denoise(local, iw, ih)
+    kids = merge_boxes(components(local, iw, ih), 8)
+    parent_area = bw * bh
+    out: list[tuple[int, int, int, int]] = []
+    for kx, ky, kw, kh in kids:
+        if kw < NEST_CHILD_MIN_SIDE or kh < NEST_CHILD_MIN_SIDE:
+            continue
+        if kw * kh < CLASSIFY_MIN_AREA:
+            continue
+        if kw * kh > 0.85 * parent_area:
+            continue
+        shorter = min(kw, kh)
+        longer = max(kw, kh)
+        if shorter > 0 and longer / shorter > CLASSIFY_MAX_ASPECT:
+            continue
+        out.append((kx + ix, ky + iy, kw, kh))
+    return out
+
+
+def _split_nested(
+    rgb: bytes,
+    w: int,
+    h: int,
+    box: tuple[int, int, int, int],
+    depth: int = 0,
+) -> list[tuple[int, int, int, int]]:
+    _x, _y, _bw, bh = box
+    if depth >= 2 or bh < NEST_MIN_H:
+        return [box]
+    kids = _nested_children(rgb, w, h, box)
+    if len(kids) < 2:
+        return [box]
+    out: list[tuple[int, int, int, int]] = []
+    for kid in kids:
+        out.extend(_split_nested(rgb, w, h, kid, depth + 1))
+    return out
+
+
+def classify_region(
+    rgb: bytes, w: int, h: int, box: tuple[int, int, int, int]
+) -> str:
+    """Pixel-first kind in {image, text, line, chrome}. No OCR."""
+    _x, _y, bw, bh = box
+    if bw <= 0 or bh <= 0 or w <= 0 or h <= 0 or not rgb:
+        return "chrome"
+    if _is_line_box(box, w, h):
+        return "line"
+    if bw >= int(w * 0.92) and bh >= int(h * 0.92):
+        return "chrome"
+    bg = estimate_background_rgb(rgb, w, h)
+    var, mean_rgb, fill, n = _box_stats(rgb, w, h, box, bg)
+    if n <= 0:
+        return "chrome"
+    size_ok = (
+        bw >= IMAGE_MIN_SIDE
+        and bh >= IMAGE_MIN_SIDE
+        and bw * bh >= IMAGE_MIN_AREA
+    )
+    br, bgc, bb = bg
+    mr, mg, mb = mean_rgb
+    not_bg = (
+        abs(mr - br) > THRESH
+        or abs(mg - bgc) > THRESH
+        or abs(mb - bb) > THRESH
+    )
+    solid = var <= CLASSIFY_SOLID_VAR
+    photo = var > CLASSIFY_VAR_HIGH and fill >= CLASSIFY_FILL_IMAGE
+    if size_ok and (photo or (not_bg and (solid or fill >= CLASSIFY_FILL_IMAGE))):
+        return "image"
+    if bw < IMAGE_MIN_SIDE and bh < IMAGE_MIN_SIDE:
+        return "chrome"
+    if max(bw, bh) <= 48:
+        return "chrome"
+    if bw * bh < CLASSIFY_MIN_AREA:
+        return "chrome"
+    return "text"
+
+
+def detect_and_classify(rgb: bytes, w: int, h: int) -> list[dict]:
+    """UIED-inspired boxes: gradient → denoise → rm_line → nest → classify.
+
+    Returns list of {kind, box:(x,y,w,h)} sorted by (y, x). OCR is not run.
+    """
+    if w <= 0 or h <= 0 or not rgb:
+        return []
+    mask = gradient_mask(rgb, w, h)
+    br, bg, bb = estimate_background_rgb(rgb, w, h)
+    n = w * h
+    for i in range(n):
+        if mask[i]:
+            continue
+        o = i * 3
+        if (
+            abs(rgb[o] - br) > THRESH
+            or abs(rgb[o + 1] - bg) > THRESH
+            or abs(rgb[o + 2] - bb) > THRESH
+        ):
+            mask[i] = 1
+    mask = denoise(mask, w, h)
+    mask = majority3(mask, w, h)
+    pre = bytearray(mask)
+    cleaned = rm_line(mask, w, h)
+    content = merge_boxes(components(cleaned, w, h), MERGE_GAP)
+    content = _filter_classify_boxes(content, w, h)
+    split: list[tuple[int, int, int, int]] = []
+    for box in content:
+        split.extend(_split_nested(rgb, w, h, box))
+    split = _filter_classify_boxes(split, w, h)
+
+    recs: list[dict] = []
+    for box in split:
+        recs.append({"kind": classify_region(rgb, w, h, box), "box": box})
+
+    line_mask = bytearray(n)
+    for i in range(n):
+        if pre[i] and not cleaned[i]:
+            line_mask[i] = 1
+    line_boxes = merge_boxes(components(line_mask, w, h), 4)
+    for box in merge_boxes(components(pre, w, h), MERGE_GAP):
+        if _is_line_box(box, w, h):
+            line_boxes.append(box)
+    for box in line_boxes:
+        if not _is_line_box(box, w, h) and classify_region(rgb, w, h, box) != "line":
+            continue
+        if any(_box_iou(box, rec["box"]) > 0.4 for rec in recs):
+            continue
+        recs.append({"kind": "line", "box": box})
+
+    recs.sort(key=lambda rec: (rec["box"][1], rec["box"][0]))
+    return recs
+
+
 def cache_images(
     thread_png: str,
     images_dir: str,
@@ -2609,7 +3012,8 @@ def cache_images(
 ) -> list[dict]:
     """Crop image-like bubbles from a thread PNG into images_dir (hash-named).
 
-    Idempotent: existing {hash}.png is reused, never written as a second file.
+    Pixel-first classify_region decides kind; OCR runs only for kind==text
+    (and those are not cached). Idempotent: existing {hash}.png is reused.
     Sidecar {hash}.json is {hash, box, at}. Local persist only; never sent.
     """
     os.makedirs(images_dir, exist_ok=True)
@@ -2621,13 +3025,13 @@ def cache_images(
         rgb = decode_rgb24(ffmpeg, thread_png, w, h, os.path.join(td, "t.rgb"))
         boxes = detect_image_boxes(rgb, w, h)
         for i, box in enumerate(boxes):
+            kind = classify_region(rgb, w, h, box)
+            if kind != "image":
+                continue
             crop = os.path.join(td, f"c{i}.png")
             try:
                 crop_png(ffmpeg, thread_png, crop, box)
             except (OSError, subprocess.CalledProcessError):
-                continue
-            _text, kind = ocr_png(crop, box)
-            if kind != "image":
                 continue
             try:
                 with open(crop, "rb") as fh:
@@ -2777,6 +3181,11 @@ def main() -> int:
         help="read-only: crop image-like bubbles into persist/watch/images (never sent)",
     )
     p.add_argument(
+        "--classify",
+        metavar="THREAD.png",
+        help="pixel-first UIED-inspired region kinds (image/text/line/chrome); no OCR",
+    )
+    p.add_argument(
         "--images-dir",
         help="hashed image crops (default: $WECHAT_PERSIST/watch/images)",
     )
@@ -2879,6 +3288,24 @@ def main() -> int:
         emit_images_stdout(recs)
         return 0
 
+    if args.classify:
+        if not os.path.isfile(args.classify):
+            print(f"ERROR: thread png missing: {args.classify}", file=sys.stderr)
+            return 2
+        ffmpeg = resolve_ffmpeg(args.ffmpeg)
+        w, h = png_size(args.classify)
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-cls-") as td:
+            rgb = decode_rgb24(ffmpeg, args.classify, w, h, os.path.join(td, "t.rgb"))
+        recs = detect_and_classify(rgb, w, h)
+        print(f"regions={len(recs)}")
+        for i, rec in enumerate(recs):
+            x, y, bw, bh = rec["box"]
+            print(f"kind{i}={rec['kind']}")
+            print(f"box{i}={x},{y},{bw},{bh}")
+        for rec in recs:
+            print(f"kind={rec['kind']}")
+        return 0
+
     if args.should_record:
         rec = should_record_scroll(bool(args.list_changed), bool(args.scrolling))
         print(f"record={1 if rec else 0}")
@@ -2943,7 +3370,7 @@ def main() -> int:
         return 0
 
     if not args.prev or not args.curr:
-        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread / --detect-nav / --cache-images / --window-geom / --fingerprint / --fingerprint-json")
+        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread / --detect-nav / --cache-images / --classify / --window-geom / --fingerprint / --fingerprint-json")
     if not args.out_dir or not args.json:
         p.error("--out-dir and --json are required unless --detect-scroll / --parse-frames / --should-record")
 
