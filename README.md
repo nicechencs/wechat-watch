@@ -248,7 +248,7 @@ unread0_name=独立产品创业
 - 排版：普通块 `--psm 6`，短条 / 徽章状 `--psm 7`（按框尺寸判断，不以 x=0 当徽章）
 - `kind=text`：去掉空白后，至少 1 个汉字，或至少 2 个字母数字
 - `kind=image`：空、纯空白、或只有标点（照片、空白、图标）
-- 会话名 / 群昵称走 `normalize_nick`：去掉空白和常见 OCR 噪点（`|||` `~~~`），空昵称或纯符号不当名字；汉字、字母数字、少量表情可保留。短垃圾不当 `text`。可用 `--normalize-nick` 单独检查（`nick=` / `ok=0|1`）
+- 会话名 / 群昵称走 `normalize_nick`：去掉空白和常见 OCR 噪点（`|||` `~~~` 这类 Tesseract 连跑噪点），空昵称或纯噪点不当名字；OCR 已识别到的装饰符号（★♥「」$ 等）要保留，不要当垃圾丢掉。汉字、字母数字、少量表情可保留。短垃圾不当 `text`。可用 `--normalize-nick` 单独检查（`nick=` / `ok=0|1`）
 - `UNCHANGED` 不会跑 OCR（除非正在翻历史、已经开始解析录像帧）
 
 语言包优先读 `$WECHAT_PERSIST/tessdata`（`TESSDATA_PREFIX`）。reset 后可用 `ensure-wechat` 按 `apt-deps.txt` 把 tesseract 装回来。

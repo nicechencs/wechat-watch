@@ -2279,6 +2279,56 @@ class NickRobustTests(unittest.TestCase):
         self.assertEqual(regions.normalize_nick(chen + " Hello"), chen + " Hello")
         self.assertTrue(regions.is_plausible_nick(chen + "A"))
 
+    def test_recognized_symbols_are_kept(self):
+        star = "\u2605"
+        heart = "\u2665"
+        a_kun = "\u963f\u5764"
+        decorated = a_kun + star + heart
+        wrapped = star + a_kun + star
+        self.assertEqual(regions.normalize_nick(decorated), decorated)
+        self.assertTrue(regions.is_plausible_nick(decorated))
+        self.assertEqual(regions.normalize_nick(wrapped), wrapped)
+        self.assertTrue(regions.is_plausible_nick(wrapped))
+        cli = self._cli(decorated)
+        self.assertEqual(cli["nick"], decorated)
+        self.assertEqual(cli["ok"], "1")
+
+        lq = "\u300c"
+        rq = "\u300d"
+        product = "\u72ec\u7acb\u4ea7\u54c1"
+        corner = lq + product + rq
+        self.assertEqual(regions.normalize_nick(corner), corner)
+        self.assertTrue(regions.is_plausible_nick(corner))
+        cli = self._cli(corner)
+        self.assertEqual(cli["nick"], corner)
+        self.assertEqual(cli["ok"], "1")
+
+        self.assertEqual(regions.normalize_nick("$Nice"), "$Nice")
+        self.assertEqual(regions.normalize_nick("Nice@x"), "Nice@x")
+        self.assertTrue(regions.is_plausible_nick("$Nice"))
+        self.assertTrue(regions.is_plausible_nick("Nice@x"))
+        cli = self._cli("$Nice")
+        self.assertEqual(cli["nick"], "$Nice")
+        self.assertEqual(cli["ok"], "1")
+        cli = self._cli("Nice@x")
+        self.assertEqual(cli["nick"], "Nice@x")
+        self.assertEqual(cli["ok"], "1")
+
+        self.assertEqual(regions.normalize_nick("|||~~~"), "")
+        self.assertFalse(regions.is_plausible_nick("|||~~~"))
+        cli = self._cli("|||~~~")
+        self.assertEqual(cli["nick"], "")
+        self.assertEqual(cli["ok"], "0")
+
+        chen = "\u9648"
+        self.assertEqual(regions.normalize_nick(chen + "A"), chen)
+        self.assertEqual(regions.normalize_nick("A" + chen), chen)
+        self.assertEqual(regions.normalize_nick(chen + " Hello"), chen + " Hello")
+
+        raw = "\u963f\u5764\n\U0001F600"
+        expect = "\u963f\u5764 \U0001F600"
+        self.assertEqual(regions.normalize_nick(raw), expect)
+
     def test_emoji_only_is_plausible(self):
         face = "\U0001F600"
         self.assertEqual(regions.normalize_nick(face), face)

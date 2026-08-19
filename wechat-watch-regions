@@ -45,6 +45,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -439,7 +440,7 @@ def is_cjk(ch: str) -> bool:
 
 # Long tesseract noise runs dumped into nick / session OCR.
 _NICK_JUNK_RUN = re.compile(r"[|/\\~`']{2,}")
-# Small set kept in nicks; | / ~-runs / ` / ' are stripped as junk, not names.
+# Common nick decorations (documentation only; not an allowlist).
 _NICK_PUNCT = frozenset("·._-*~（）()【】[]!?，。、:：#@＋+")
 
 
@@ -465,11 +466,28 @@ def _is_ascii_letter(ch: str) -> bool:
 
 
 def _keep_nick_char(ch: str) -> bool:
+    """Keep printable leftovers OCR already recognized; drop only controls.
+
+    Junk runs of | / \\ ~ ` ' are stripped by _NICK_JUNK_RUN before this filter.
+    A single leftover of those chars may remain. ZWJ / variation selectors stay
+    via is_emoji_like even though they are not printable.
+    """
     if ch == " ":
         return True
     if is_cjk(ch) or ch.isalnum() or is_emoji_like(ch):
         return True
-    return ch in _NICK_PUNCT
+    if not ch.isprintable():
+        return False
+    cat = unicodedata.category(ch)
+    if cat.startswith("C"):
+        return False
+    if cat[0] in ("P", "S"):
+        return True
+    if 0xFF00 <= ord(ch) <= 0xFFEF:
+        return True
+    if ch in _NICK_PUNCT:
+        return True
+    return True
 
 
 def _drop_isolated_latin_near_cjk(s: str) -> str:
@@ -503,9 +521,11 @@ def _drop_isolated_latin_near_cjk(s: str) -> str:
 
 
 def normalize_nick(raw: str) -> str:
-    """Strip, collapse whitespace, drop tesseract junk; keep CJK / alnum / emoji.
+    """Strip, collapse whitespace, drop OCR junk; keep recognized decorative symbols.
 
-    Isolated Latin next to CJK is dropped (CJK stays). Empty after clean → "".
+    Keep CJK / alnum / emoji and printable punctuation/symbols OCR already
+    recognized. Drop only tesseract junk runs, controls, and isolated Latin
+    next to CJK (CJK stays). Empty after clean → "".
     """
     if not raw:
         return ""
