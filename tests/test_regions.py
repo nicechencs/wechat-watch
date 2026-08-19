@@ -1972,7 +1972,7 @@ class ClassifyRegionTests(unittest.TestCase):
             )
             recs = regions.detect_and_classify(rgb, w, h)
             kinds = [r["kind"] for r in recs]
-            self.assertIn("image", kinds, recs)
+            self.assertEqual(kinds.count("image"), 1, recs)
             self.assertIn("text", kinds, recs)
             self.assertEqual(
                 regions.classify_region(rgb, w, h, (80, 40, 200, 160)),
@@ -1997,7 +1997,15 @@ class ClassifyRegionTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            self.assertIn("kind=image", proc.stdout)
+            indexed_image = [
+                ln
+                for ln in proc.stdout.splitlines()
+                if ln.startswith("kind")
+                and len(ln) > 4
+                and ln[4].isdigit()
+                and ln.endswith("=image")
+            ]
+            self.assertEqual(len(indexed_image), 1, proc.stdout)
             self.assertIn("kind=text", proc.stdout)
             parsed = _parse_unread_stdout(proc.stdout)
             n = int(parsed.get("regions", "0"))
@@ -2107,9 +2115,40 @@ class TimeDividerTests(unittest.TestCase):
     """Centered WeChat time/date chips. Pixel-first, OCR only those boxes."""
 
     def test_parse_time_divider_units(self):
-        self.assertIsNotNone(regions.parse_time_divider("今天 16:04"))
-        self.assertIsNotNone(regions.parse_time_divider("Today 16:04"))
+        today = regions.parse_time_divider("今天 16:04")
+        self.assertEqual(today["kind"], "today")
+        self.assertEqual(today["hh"], 16)
+        self.assertEqual(today["mm"], 4)
+        self.assertEqual(today["raw"], "今天 16:04")
+        self.assertIn("今天", today["text"])
+
+        ascii_today = regions.parse_time_divider("Today 16:04")
+        self.assertEqual(ascii_today["kind"], "today")
+        self.assertEqual(ascii_today["hh"], 16)
+        self.assertEqual(ascii_today["mm"], 4)
+        self.assertEqual(ascii_today["raw"], "Today 16:04")
+
+        yest = regions.parse_time_divider("昨天 21:10")
+        self.assertEqual(yest["kind"], "yesterday")
+        self.assertEqual(yest["hh"], 21)
+        self.assertEqual(yest["mm"], 10)
+        self.assertEqual(yest["raw"], "昨天 21:10")
+
+        date = regions.parse_time_divider("2026年8月19日")
+        self.assertEqual(date["kind"], "date")
+        self.assertEqual(date["raw"], "2026年8月19日")
+        self.assertNotIn("hh", date)
+        self.assertNotIn("mm", date)
+
+        just = regions.parse_time_divider("刚刚")
+        self.assertEqual(just["kind"], "just_now")
+        self.assertEqual(just["raw"], "刚刚")
+        self.assertNotIn("hh", just)
+        self.assertNotIn("mm", just)
+
         self.assertIsNone(regions.parse_time_divider("hello world"))
+        self.assertIsNone(regions.parse_time_divider(""))
+        self.assertIsNone(regions.parse_time_divider("你好"))
 
     def test_synthetic_chip_cli_and_api(self):
         self.assertTrue(os.path.isfile(PERSIST_FFMPEG), "persist ffmpeg missing")
