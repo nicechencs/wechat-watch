@@ -1607,7 +1607,10 @@ def unread_row_bands(h: int, row_h: int = UNREAD_ROW_H) -> list[tuple[int, int]]
 def parse_row_title(raw: str) -> str:
     if not raw:
         return ""
-    line = raw.strip().splitlines()[0].strip()
+    lines = raw.strip().splitlines()
+    if not lines:
+        return ""
+    line = lines[0].strip()
     line = re.sub(r"\s+\d{1,2}:\d{2}\s*$", "", line)
     nick = normalize_nick(line)
     if not is_plausible_nick(nick):

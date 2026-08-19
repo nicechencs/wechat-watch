@@ -2199,50 +2199,94 @@ class TimeDividerTests(unittest.TestCase):
 class NickRobustTests(unittest.TestCase):
     """Nickname / session-name: empty, tesseract junk, emoji leftovers."""
 
-    def test_normalize_cjk_stripped_is_plausible(self):
-        self.assertEqual(regions.normalize_nick("  陈  "), "陈")
-        self.assertTrue(regions.is_plausible_nick("  陈  "))
-        self.assertTrue(regions.is_plausible_nick("陈"))
+    def _cli(self, raw: str) -> dict:
+        proc = subprocess.run(
+            [sys.executable, SCRIPT, "--normalize-nick", raw],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotIn("ERROR", proc.stderr)
+        parsed = _parse_unread_stdout(proc.stdout)
+        self.assertIn("nick", parsed, proc.stdout)
+        self.assertIn("ok", parsed, proc.stdout)
+        return parsed
 
-    def test_tess_junk_empty_not_plausible(self):
+    def test_empty_is_not_a_name(self):
+        self.assertEqual(regions.normalize_nick(""), "")
+        self.assertEqual(regions.normalize_nick("   \n\t  "), "")
+        self.assertFalse(regions.is_plausible_nick(""))
+        self.assertFalse(regions.is_plausible_nick("   "))
+        self.assertEqual(regions.parse_nickname(""), "")
+        self.assertEqual(regions.parse_row_title(""), "")
+        self.assertEqual(regions.parse_row_title("   \n"), "")
+        kind, text = regions.classify_ocr("")
+        self.assertEqual(kind, "image")
+        self.assertEqual(text, "")
+        cli = self._cli("")
+        self.assertEqual(cli["nick"], "")
+        self.assertEqual(cli["ok"], "0")
+
+
+    def test_tess_junk_is_not_a_name(self):
         self.assertEqual(regions.normalize_nick("|||~~~"), "")
         self.assertFalse(regions.is_plausible_nick("|||~~~"))
-        self.assertFalse(regions.is_plausible_nick(""))
         self.assertFalse(regions.is_plausible_nick("A"))
         self.assertFalse(regions.is_plausible_nick("...!!!"))
-
-    def test_cjk_with_emoji_keeps_cjk(self):
-        nick = regions.normalize_nick("阿坤\n😀")
-        self.assertIn("阿坤", nick)
-        self.assertTrue(regions.is_plausible_nick("阿坤\n😀"))
-        self.assertTrue(regions.is_plausible_nick(nick))
-
-    def test_parse_nickname_and_row_title_drop_garbage(self):
-        self.assertEqual(regions.parse_nickname("|||陈|||"), "陈")
         self.assertEqual(regions.parse_nickname("|||~~~"), "")
-        self.assertEqual(regions.parse_row_title("  陈  12:03"), "陈")
         self.assertEqual(regions.parse_row_title("|||~~~"), "")
-        self.assertEqual(regions.parse_nickname("😀"), "😀")
-        self.assertTrue(regions.is_plausible_nick("😀"))
+        kind, text = regions.classify_ocr("|||~~~")
+        self.assertEqual(kind, "image")
+        self.assertEqual(text, "")
+        cli = self._cli("|||~~~")
+        self.assertEqual(cli["nick"], "")
+        self.assertEqual(cli["ok"], "0")
 
-    def test_cli_normalize_nick(self):
-        proc = subprocess.run(
-            [sys.executable, SCRIPT, "--normalize-nick", "陈"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        self.assertIn("nick=陈", proc.stdout)
-        self.assertIn("ok=1", proc.stdout)
-        junk = subprocess.run(
-            [sys.executable, SCRIPT, "--normalize-nick", "|||~~~"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        self.assertIn("nick=", junk.stdout)
-        self.assertIn("ok=0", junk.stdout)
-        self.assertNotIn("ERROR", junk.stderr)
+    def test_cjk_nick_is_plausible(self):
+        chen = "\u9648"
+        self.assertEqual(regions.normalize_nick("  " + chen + "  "), chen)
+        self.assertTrue(regions.is_plausible_nick("  " + chen + "  "))
+        self.assertTrue(regions.is_plausible_nick(chen))
+        self.assertEqual(regions.parse_nickname("|||" + chen + "|||"), chen)
+        self.assertEqual(regions.parse_row_title("  " + chen + "  12:03"), chen)
+        kind, text = regions.classify_ocr("  " + chen + "  ")
+        self.assertEqual(kind, "text")
+        self.assertEqual(text, chen)
+        cli = self._cli(chen)
+        self.assertEqual(cli["nick"], chen)
+        self.assertEqual(cli["ok"], "1")
+
+    def test_emoji_leftover_keeps_cjk(self):
+        raw = "\u963f\u5764\n\U0001F600"
+        expect = "\u963f\u5764 \U0001F600"
+        nick = regions.normalize_nick(raw)
+        self.assertEqual(nick, expect)
+        self.assertIn("\u963f\u5764", nick)
+        self.assertTrue(regions.is_plausible_nick(raw))
+        self.assertTrue(regions.is_plausible_nick(nick))
+        kind, text = regions.classify_ocr(raw)
+        self.assertEqual(kind, "text")
+        self.assertEqual(text, expect)
+        self.assertIn("\u963f\u5764", text)
+        cli = self._cli(raw)
+        self.assertEqual(cli["nick"], expect)
+        self.assertEqual(cli["ok"], "1")
+
+    def test_isolated_latin_near_cjk_dropped(self):
+        chen = "\u9648"
+        self.assertEqual(regions.normalize_nick(chen + "A"), chen)
+        self.assertEqual(regions.normalize_nick("A" + chen), chen)
+        self.assertEqual(regions.normalize_nick(chen + " Hello"), chen + " Hello")
+        self.assertTrue(regions.is_plausible_nick(chen + "A"))
+
+    def test_emoji_only_is_plausible(self):
+        face = "\U0001F600"
+        self.assertEqual(regions.normalize_nick(face), face)
+        self.assertTrue(regions.is_plausible_nick(face))
+        self.assertEqual(regions.parse_nickname(face), face)
+        kind, text = regions.classify_ocr(face)
+        self.assertEqual(kind, "text")
+        self.assertEqual(text, face)
 
     def test_cli_missing_args_keeps_error_style(self):
         proc = subprocess.run(
@@ -2253,6 +2297,12 @@ class NickRobustTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("--normalize-nick", proc.stderr)
         self.assertIn("required unless", proc.stderr)
+
+    def test_diff_does_not_call_normalize_nick(self):
+        with open(os.path.join(ROOT, "wechat-watch-diff"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertNotIn("--normalize-nick", src)
+        self.assertNotIn("normalize_nick", src)
 
 
 if __name__ == "__main__":
