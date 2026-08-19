@@ -23,6 +23,8 @@ Usage:
   wechat-watch-regions --ocr-still THREAD.png [--json OUT.json] [--when ISO8601]
   wechat-watch-regions --detect-unread LIST.png   # red badge / dot / [N条] (read-only)
   wechat-watch-regions --detect-nav NAV.png       # left-nav icon badges (read-only)
+  wechat-watch-regions --window-geom [--window-png WIN.png]
+      # win/nav/list/thread + source=; PNG scans gutters inside the window
 """
 from __future__ import annotations
 
@@ -70,12 +72,39 @@ IDENTITIES_VERSION = 1
 LIST_CROP = (440, 700, 70, 30)
 THREAD_CROP = (720, 660, 414, 40)
 FULL_DESKTOP = (1280, 800)
+APP_NAME = "WeChat"
+# Skip menus / tooltips when parsing a window dump.
+_WINDOW_MIN_W = 400
+_WINDOW_MIN_H = 300
+_APP_ALIASES = ("wechat", "weixin", "微信")
+_X11_GEOM_RE = re.compile(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)")
+_X11_SPEC_RE = re.compile(r"^\s*(\d+)x(\d+)([+-]\d+)([+-]\d+)\s*$")
+_XYWH_COMMA_RE = re.compile(r"^\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*$")
+_ABS_POS_RE = re.compile(r"([+-]\d+)([+-]\d+)\s*$")
+_WIN_ID_RE = re.compile(r"0x[0-9a-fA-F]+")
+_QUOTED_RE = re.compile(r'"([^"]*)"')
+_CLASS_PAIR_RE = re.compile(r'\(\s*"([^"]*)"\s+"([^"]*)"\s*\)')
+_WM_LG_RE = re.compile(
+    r"^0x[0-9a-fA-F]+\s+-?\d+\s+(-?\d+)\s+(-?\d+)\s+(\d+)\s+(\d+)\s+\S+\s+(.*\S)?\s*$"
+)
 
 # Left nav strip (window-client coords). No dedicated Files slot.
 NAV_W = 62
 NAV_INSET = 1
 LIST_INSET = 63
 THREAD_INSET = 282
+# Window-local pane scan. LIST_INSET/THREAD_INSET stay fallback-only.
+PANE_NAV_AFTER = 40
+PANE_LIST_MIN_W = 120
+PANE_THREAD_MIN_W = 80
+PANE_NAV_MAX_X = 160
+PANE_TOP_FRAC = 0.04
+PANE_BOTTOM_FRAC = 0.10
+PANE_TOP_MIN = 16
+PANE_BOTTOM_MIN = 48
+PANE_GUTTER_SCORE_MIN = 20
+PANE_GUTTER_NMS = 5
+PANE_LUMA_RANGE_MIN = 18
 NAV_STRIP_W_MIN = 50
 NAV_STRIP_W_MAX = 80
 NAV_WINDOW_MIN_H = 400
@@ -1620,10 +1649,276 @@ def nav_source_box(w: int, h: int) -> tuple[int, int, int, int] | None:
     return None
 
 
-def window_crops(
-    win_x: int, win_y: int, win_w: int, win_h: int
+def pane_top_fallback(h: int) -> int:
+    return max(PANE_TOP_MIN, int(PANE_TOP_FRAC * h))
+
+
+def pane_bottom_fallback(h: int) -> int:
+    return max(PANE_BOTTOM_MIN, int(PANE_BOTTOM_FRAC * h))
+
+
+def _col_lumas(rgb: bytes, w: int, h: int, y0: int, y1: int) -> list[int]:
+    """Mean luma of each column in [y0, y1)."""
+    span = max(1, y1 - y0)
+    out = [0] * w
+    for x in range(w):
+        total = 0
+        for y in range(y0, y1):
+            i = (y * w + x) * 3
+            total += rgb_luma(rgb[i], rgb[i + 1], rgb[i + 2])
+        out[x] = total // span
+    return out
+
+
+def _snap_pane_start(lumas: list[int], x: int) -> int:
+    """Map a gutter peak to the first column of the pane to its right."""
+    n = len(lumas)
+    if n == 0:
+        return x
+    x = max(1, min(x, n - 1))
+    mid = lumas[x]
+    left = lumas[x - 1]
+    right = lumas[x + 1] if x + 1 < n else mid
+    if mid < left - 10 and mid < right - 10:
+        return min(n - 1, x + 1)
+    return x
+
+
+def _gutter_peaks(lumas: list[int]) -> list[tuple[int, float]]:
+    """Local-maxima gutter candidates: (x, score) left to right."""
+    n = len(lumas)
+    if n < 4:
+        return []
+    raw: list[tuple[int, float]] = []
+    for x in range(1, n - 1):
+        left, mid, right = lumas[x - 1], lumas[x], lumas[x + 1]
+        dip = min(left, right) - mid
+        jump = right - left
+        edge = abs(right - left)
+        score = 0.0
+        if dip >= 15 and mid + 10 < left and mid + 10 < right:
+            score = float(dip + max(0, 40 - mid))
+        if jump >= 20:
+            score = max(score, float(jump))
+        if edge >= 28:
+            score = max(score, float(edge))
+        if score >= PANE_GUTTER_SCORE_MIN:
+            raw.append((x, score))
+    raw.sort(key=lambda t: -t[1])
+    kept: list[tuple[int, float]] = []
+    for x, score in raw:
+        if any(abs(x - kx) <= PANE_GUTTER_NMS for kx, _s in kept):
+            continue
+        kept.append((x, score))
+    kept.sort(key=lambda t: t[0])
+    return kept
+
+
+def _scan_top(rows: list[int], h: int) -> int:
+    fb = pane_top_fallback(h)
+    if h < 32 or len(rows) < h:
+        return fb
+    limit = max(fb + 1, int(h * 0.22))
+    limit = min(limit, h - 8)
+    mid = rows[h // 3 : (2 * h) // 3]
+    if not mid:
+        return fb
+    content = sorted(mid)[len(mid) // 2]
+    thresh = content - 25
+    last_dark = None
+    for y in range(0, limit):
+        if rows[y] < thresh:
+            last_dark = y
+        elif last_dark is not None:
+            break
+    if last_dark is None:
+        for y in range(1, limit):
+            if rows[y] - rows[y - 1] >= 22:
+                top = y
+                if 8 <= top <= int(h * 0.22):
+                    return top
+                break
+        return fb
+    top = last_dark + 1
+    if top < 8 or top > int(h * 0.22):
+        return fb
+    return top
+
+
+def _scan_bottom(rows: list[int], h: int) -> int:
+    fb = pane_bottom_fallback(h)
+    if h < 48 or len(rows) < h:
+        return fb
+    search = max(0, h - max(fb, int(h * 0.35)))
+    mid = rows[h // 3 : (2 * h) // 3]
+    if not mid:
+        return fb
+    content = sorted(mid)[len(mid) // 2]
+    thresh = content - 25
+    footer_top = None
+    for y in range(h - 1, search - 1, -1):
+        if rows[y] < thresh:
+            footer_top = y
+        elif footer_top is not None:
+            break
+    if footer_top is None:
+        for y in range(h - 2, search - 1, -1):
+            if rows[y] - rows[y + 1] >= 22:
+                bottom = h - (y + 1)
+                if 16 <= bottom <= int(h * 0.35):
+                    return bottom
+                break
+        return fb
+    bottom = h - footer_top
+    if bottom < 16 or bottom > int(h * 0.35):
+        return fb
+    return bottom
+
+
+def detect_panes(rgb: bytes, w: int, h: int) -> dict | None:
+    """Scan a window-local rgb24 frame for nav|list and list|thread gutters.
+
+    Not a live-app probe. LIST_INSET/THREAD_INSET are never the scan result;
+    those stay caller fallback when this returns None.
+    """
+    if w <= 0 or h <= 0 or not rgb:
+        return None
+    if len(rgb) < w * h * 3:
+        return None
+    if w < PANE_NAV_AFTER + PANE_LIST_MIN_W + PANE_THREAD_MIN_W:
+        return None
+    if h < 48:
+        return None
+    y0 = max(0, int(h * 0.12))
+    y1 = min(h, int(h * 0.82))
+    if y1 - y0 < 16:
+        y0, y1 = 0, h
+    lumas = _col_lumas(rgb, w, h, y0, y1)
+    if max(lumas) - min(lumas) < PANE_LUMA_RANGE_MIN:
+        return None
+    peaks = _gutter_peaks(lumas)
+    if not peaks:
+        return None
+    starts: list[tuple[int, float]] = []
+    for x, score in peaks:
+        px = _snap_pane_start(lumas, x)
+        if px < PANE_NAV_AFTER:
+            continue
+        if starts and px - starts[-1][0] <= PANE_GUTTER_NMS:
+            if score > starts[-1][1]:
+                starts[-1] = (px, score)
+            continue
+        starts.append((px, score))
+    nav_max = min(PANE_NAV_MAX_X, max(PANE_NAV_AFTER + 8, w // 4))
+    list_x = None
+    list_score = 0.0
+    for px, score in starts:
+        if PANE_NAV_AFTER <= px <= nav_max:
+            list_x = px
+            list_score = score
+            break
+    if list_x is None:
+        return None
+    thread_need = list_x + PANE_LIST_MIN_W
+    thread_x = None
+    thread_score = 0.0
+    for px, score in starts:
+        if px < thread_need:
+            continue
+        if px > w - PANE_THREAD_MIN_W:
+            continue
+        thread_x = px
+        thread_score = score
+        break
+    if thread_x is None:
+        return None
+    if thread_x - list_x < PANE_LIST_MIN_W:
+        return None
+    if list_score < PANE_GUTTER_SCORE_MIN or thread_score < PANE_GUTTER_SCORE_MIN:
+        return None
+    rows = row_lumas(rgb, w, h)
+    top = _scan_top(rows, h)
+    bottom = _scan_bottom(rows, h)
+    if top + bottom >= h - 8:
+        top = pane_top_fallback(h)
+        bottom = pane_bottom_fallback(h)
+        if top + bottom >= h - 8:
+            return None
+    nav_x = 0
+    nav_w = max(1, list_x - nav_x)
+    list_w = thread_x - list_x
+    thread_w = w - thread_x
+    return {
+        "list_x": int(list_x),
+        "thread_x": int(thread_x),
+        "top": int(top),
+        "bottom": int(bottom),
+        "nav_x": int(nav_x),
+        "nav_w": int(nav_w),
+        "list_w": int(list_w),
+        "thread_w": int(thread_w),
+    }
+
+
+def _crops_from_panes(
+    win_x: int, win_y: int, win_w: int, win_h: int, panes: dict
 ) -> dict[str, tuple[int, int, int, int]]:
-    """Nav / list / thread boxes in desktop coords for a WeChat window."""
+    list_x = int(panes["list_x"])
+    thread_x = int(panes["thread_x"])
+    top = int(panes["top"])
+    bottom = int(panes["bottom"])
+    list_x = max(0, min(list_x, max(0, win_w - 2)))
+    thread_x = max(list_x + 1, min(thread_x, max(list_x + 1, win_w - 1)))
+    top = max(0, min(top, max(0, win_h - 1)))
+    bottom = max(0, min(bottom, max(0, win_h - top - 1)))
+    nav_x = int(panes["nav_x"]) if panes.get("nav_x") is not None else 0
+    nav_w = int(panes["nav_w"]) if panes.get("nav_w") is not None else max(1, list_x - nav_x)
+    list_w = int(panes["list_w"]) if panes.get("list_w") is not None else thread_x - list_x
+    thread_w = int(panes["thread_w"]) if panes.get("thread_w") is not None else win_w - thread_x
+    nav_x = max(0, min(nav_x, max(0, win_w - 1)))
+    nav_w = max(1, min(nav_w, win_w - nav_x))
+    list_w = max(1, min(list_w, win_w - list_x))
+    thread_w = max(1, min(thread_w, win_w - thread_x))
+    crop_h = max(1, win_h - top - bottom)
+    return {
+        "nav": (win_x + nav_x, win_y, nav_w, win_h),
+        "list": (win_x + list_x, win_y + top, list_w, crop_h),
+        "thread": (win_x + thread_x, win_y + top, thread_w, crop_h),
+    }
+
+
+def window_crops(
+    win_x: int,
+    win_y: int,
+    win_w: int,
+    win_h: int,
+    panes: dict | None = None,
+    rgb: bytes | None = None,
+    frame_w: int | None = None,
+    frame_h: int | None = None,
+) -> dict[str, tuple[int, int, int, int]]:
+    """Nav / list / thread boxes in desktop coords for a WeChat window.
+
+    MOVE: if find_window has the rect (WECHAT_WINDOW / root-tree / wm
+    list-geometry), adding win_x/win_y translates crops; that already works.
+    RESIZE or a dragged list|thread splitter is not followed by fixed
+    NAV_INSET=1, LIST_INSET=63, THREAD_INSET=282 — pass rgb/panes so
+    detect_panes can scan gutters. Height: fallback used to use full win_h
+    (title + search + input/Send); the maximized path was +30/700 and
+    +40/660, and the non-scan path now applies the same top/bottom
+    fractions. DPI / fractional scale (150%/200%) is NOT handled: pixel
+    insets stay wrong until we have a real pixel rect plus a scan. We do
+    not magically scale an unknown layout.
+    """
+    if rgb is not None:
+        fw = win_w if frame_w is None else int(frame_w)
+        fh = win_h if frame_h is None else int(frame_h)
+        if fw > 0 and fh > 0:
+            found = detect_panes(rgb, fw, fh)
+            if found is not None:
+                panes = found
+    if panes:
+        return _crops_from_panes(win_x, win_y, win_w, win_h, panes)
     if (win_x, win_y, win_w, win_h) == (0, 0, *FULL_DESKTOP):
         lw, lh, lx, ly = LIST_CROP
         tw, th, tx, ty = THREAD_CROP
@@ -1632,6 +1927,11 @@ def window_crops(
             "list": (lx, ly, lw, lh),
             "thread": (tx, ty, tw, th),
         }
+    top = pane_top_fallback(win_h)
+    bottom = pane_bottom_fallback(win_h)
+    if top + bottom >= win_h:
+        top, bottom = 0, 0
+    crop_h = max(1, win_h - top - bottom)
     nav_x = win_x + NAV_INSET
     list_x = win_x + LIST_INSET
     thread_x = win_x + THREAD_INSET
@@ -1640,9 +1940,206 @@ def window_crops(
     thread_w = max(1, win_x + win_w - thread_x)
     return {
         "nav": (nav_x, win_y, nav_w, win_h),
-        "list": (list_x, win_y, list_w, win_h),
-        "thread": (thread_x, win_y, thread_w, win_h),
+        "list": (list_x, win_y + top, list_w, crop_h),
+        "thread": (thread_x, win_y + top, thread_w, crop_h),
     }
+
+
+def find_wechat_window(
+    env: dict[str, str] | None = None,
+    tree_text: str | None = None,
+    wm_text: str | None = None,
+    app: str = APP_NAME,
+    probe: bool = True,
+) -> tuple[int, int, int, int]:
+    """(x, y, w, h) from find_window. probe=False is safe (no live x11)."""
+    win, _source = find_window(
+        env=env, tree_text=tree_text, wm_text=wm_text, app=app, probe=probe
+    )
+    return win
+
+
+def parse_geom_spec(text: str) -> tuple[int, int, int, int] | None:
+    """Parse WxH+X+Y or X,Y,W,H into desktop (x, y, w, h)."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    m = _X11_SPEC_RE.match(raw)
+    if m:
+        w, h, x, y = (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+        if w > 0 and h > 0:
+            return (x, y, w, h)
+        return None
+    m = _XYWH_COMMA_RE.match(raw)
+    if m:
+        x, y, w, h = (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+        if w > 0 and h > 0:
+            return (x, y, w, h)
+        return None
+    return None
+
+
+def window_matches(title: str, wm_class: str = "", app: str = APP_NAME) -> bool:
+    """True if title or WM_CLASS looks like the desktop WeChat app (not wechat-watch)."""
+    blob = f"{title or ''} {wm_class or ''}".strip()
+    if not blob:
+        return False
+    low = blob.lower()
+    if "wechat-watch" in low:
+        return False
+    if "微信" in blob:
+        return True
+    names = {app.lower(), *(a.lower() for a in _APP_ALIASES if a.isascii())}
+    return any(name in low for name in names)
+
+
+def _geom_from_tree_line(line: str) -> tuple[int, int, int, int] | None:
+    geom_m = _X11_GEOM_RE.search(line)
+    if not geom_m:
+        return None
+    w, h = int(geom_m.group(1)), int(geom_m.group(2))
+    x, y = int(geom_m.group(3)), int(geom_m.group(4))
+    abs_m = _ABS_POS_RE.search(line)
+    if abs_m is not None and abs_m.start() >= geom_m.end():
+        x, y = int(abs_m.group(1)), int(abs_m.group(2))
+    if w < _WINDOW_MIN_W or h < _WINDOW_MIN_H:
+        return None
+    return (x, y, w, h)
+
+
+def _title_class_from_tree_line(line: str) -> tuple[str, str]:
+    class_m = _CLASS_PAIR_RE.search(line)
+    inst = class_m.group(1) if class_m else ""
+    cls = class_m.group(2) if class_m else ""
+    wm_class = f"{inst} {cls}".strip()
+    title = ""
+    for qm in _QUOTED_RE.finditer(line):
+        if class_m is not None and qm.start() >= class_m.start():
+            continue
+        title = qm.group(1)
+        break
+    return title, wm_class
+
+
+def parse_root_tree(text: str, app: str = APP_NAME) -> tuple[int, int, int, int] | None:
+    """Parse `xwininfo -root -tree` dump text. Largest matching title/class."""
+    best: tuple[int, int, int, int] | None = None
+    best_area = -1
+    for line in (text or "").splitlines():
+        if not _WIN_ID_RE.search(line) and '"' not in line:
+            continue
+        box = _geom_from_tree_line(line)
+        if box is None:
+            continue
+        title, wm_class = _title_class_from_tree_line(line)
+        if not window_matches(title, wm_class, app):
+            continue
+        area = box[2] * box[3]
+        if area > best_area:
+            best_area = area
+            best = box
+    return best
+
+
+def parse_wm_geometry(text: str, app: str = APP_NAME) -> tuple[int, int, int, int] | None:
+    """Parse `wmctrl -lG` (list-geometry) dump text. Largest matching title."""
+    best: tuple[int, int, int, int] | None = None
+    best_area = -1
+    for line in (text or "").splitlines():
+        m = _WM_LG_RE.match(line.strip())
+        if not m:
+            continue
+        x, y, w, h = (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+        title = (m.group(5) or "").strip()
+        if w < _WINDOW_MIN_W or h < _WINDOW_MIN_H:
+            continue
+        if not window_matches(title, "", app):
+            continue
+        area = w * h
+        if area > best_area:
+            best_area = area
+            best = (x, y, w, h)
+    return best
+
+
+def _dump_cmd(argv: list[str], timeout: float = 3.0) -> str:
+    """Read-only subprocess stdout. Empty on missing binary / timeout / error."""
+    try:
+        proc = subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return proc.stdout or ""
+
+
+def find_window(
+    env: dict[str, str] | None = None,
+    tree_text: str | None = None,
+    wm_text: str | None = None,
+    app: str = APP_NAME,
+    probe: bool = True,
+) -> tuple[tuple[int, int, int, int], str]:
+    """Locate the WeChat window. Read-only string parse; never drives the GUI.
+
+    Probe order:
+      1. env WECHAT_WINDOW as WxH+X+Y or X,Y,W,H
+      2. root-tree dump (xwininfo -root -tree) title/class vs app name
+      3. wm list-geometry dump (wmctrl -lG) title vs app name
+      4. FULL_DESKTOP (0, 0, 1280, 800)
+    """
+    environ = os.environ if env is None else env
+    spec = (environ.get("WECHAT_WINDOW") or "").strip()
+    if spec:
+        parsed = parse_geom_spec(spec)
+        if parsed is not None:
+            return parsed, "env"
+
+    tree = tree_text
+    if tree is None and probe:
+        tree = _dump_cmd(["xwininfo", "-root", "-tree"])
+    if tree:
+        parsed = parse_root_tree(tree, app=app)
+        if parsed is not None:
+            return parsed, "tree"
+
+    wm = wm_text
+    if wm is None and probe:
+        wm = _dump_cmd(["wmctrl", "-lG"])
+    if wm:
+        parsed = parse_wm_geometry(wm, app=app)
+        if parsed is not None:
+            return parsed, "wm"
+
+    dw, dh = FULL_DESKTOP
+    return (0, 0, dw, dh), "desktop"
+
+
+def fmt_xywh(box: tuple[int, int, int, int]) -> str:
+    x, y, w, h = box
+    return f"{int(x)},{int(y)},{int(w)},{int(h)}"
+
+
+def emit_window_geom(
+    win: tuple[int, int, int, int],
+    source: str,
+    rgb: bytes | None = None,
+    frame_w: int | None = None,
+    frame_h: int | None = None,
+) -> None:
+    x, y, w, h = win
+    crops = window_crops(
+        x, y, w, h, rgb=rgb, frame_w=frame_w, frame_h=frame_h
+    )
+    print(f"win={fmt_xywh(win)}")
+    print(f"nav={fmt_xywh(crops['nav'])}")
+    print(f"list={fmt_xywh(crops['list'])}")
+    print(f"thread={fmt_xywh(crops['thread'])}")
+    print(f"source={source}")
 
 
 def _nav_icon_box(y_frac: float, w: int, h: int) -> tuple[int, int, int, int]:
@@ -1830,7 +2327,42 @@ def main() -> int:
         metavar="NAV.png",
         help="read-only: red badge / red dot on left-nav icons (by vertical slot)",
     )
+    p.add_argument(
+        "--window-geom",
+        action="store_true",
+        help="print win/nav/list/thread as x,y,w,h and source= (env|tree|wm|desktop)",
+    )
+    p.add_argument(
+        "--window-png",
+        metavar="WIN.png",
+        help="optional window-local PNG; scan gutters and pass rgb into window_crops",
+    )
     args = p.parse_args()
+
+    if args.window_geom:
+        win, source = find_window()
+        rgb = None
+        frame_w = frame_h = None
+        if args.window_png:
+            if not os.path.isfile(args.window_png):
+                print(f"ERROR: window png missing: {args.window_png}", file=sys.stderr)
+                return 2
+            try:
+                frame_w, frame_h = png_size(args.window_png)
+                ffmpeg = resolve_ffmpeg(args.ffmpeg)
+                with tempfile.TemporaryDirectory(prefix="wechat-watch-winpng-") as td:
+                    rgb = decode_rgb24(
+                        ffmpeg,
+                        args.window_png,
+                        frame_w,
+                        frame_h,
+                        os.path.join(td, "win.rgb"),
+                    )
+            except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+                print(f"ERROR: window png: {exc}", file=sys.stderr)
+                return 2
+        emit_window_geom(win, source, rgb=rgb, frame_w=frame_w, frame_h=frame_h)
+        return 0
 
     if args.format_time:
         emit_summary_times(parse_when(args.when))
@@ -1925,7 +2457,7 @@ def main() -> int:
         return 0
 
     if not args.prev or not args.curr:
-        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread / --detect-nav")
+        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread / --detect-nav / --window-geom")
     if not args.out_dir or not args.json:
         p.error("--out-dir and --json are required unless --detect-scroll / --parse-frames / --should-record")
 

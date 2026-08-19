@@ -40,6 +40,10 @@ list.png ──sha256── list.sha256   thread.png（只用来判断滚没滚�
 
 会话列表的时间戳一般是「最后一条消息的时间」，不会每秒跳变，所以列表哈希在没新消息时是稳定的。输入框闪烁的光标在两块裁剪之外，不会误触发。
 
+裁剪跟找到的微信窗口走（`WECHAT_WINDOW=WxH+X+Y` 或 `X,Y,W,H`，或只读解析 `xwininfo -root -tree` / `wmctrl -lG`）；找不到再用上面的 1280×800 常量。
+
+**窗口移动 / 缩放 / DPI（诚实说明）：** 窗口**移动**后，只要 `find_window` 拿到矩形（`WECHAT_WINDOW` / root-tree / `wmctrl -lG`），裁剪会跟着平移，这一步已经可用。窗口被拉窄、或用户拖了列表|对话区分隔线（**resize**）时，固定的 `NAV_INSET=1`、`LIST_INSET=63`、`THREAD_INSET=282` **不会**跟着分隔线走，窄窗或拖过的 list|thread 线会裁到错误的栏；`--window-geom --window-png` 会在窗口内部扫描竖向 gutter（分隔线）来跟栏。高度上若直接用整窗 `win_h`，会把标题栏、搜索框、输入框/发送都包进去（旧的最大化路径用的是 `+30/700` 和 `+40/660`）。150% / 200% 等分数缩放（DPI）**仍未处理**：像素 inset 会对不上，需要真实像素矩形再扫描，不能凭空缩放未知布局。
+
 ## 翻历史、有滚动条才录屏
 
 人在打开的会话里往上翻历史时，左侧列表通常不变（未读轮询仍是 `UNCHANGED`），但右侧气泡在滚。这时才值得花录像的成本：
@@ -177,6 +181,11 @@ kind1=image
 
 # 左侧导航图标红点 / 数字（只读，不点图标）
 ./wechat-watch-regions --detect-nav "$WECHAT_PERSIST/watch/full.png"
+
+# 当前微信窗口矩形 + nav/list/thread 裁剪（找不到则 1280x800 常量）
+./wechat-watch-regions --window-geom
+# 有窗口截图时扫描 gutter，list/thread 跟分隔线而不是固定 63/282
+./wechat-watch-regions --window-geom --window-png "$WECHAT_PERSIST/watch/full.png"
 ```
 
 ## 区域差分规则
@@ -237,7 +246,7 @@ unread0_name=独立产品创业
 python3 tests/test_regions.py
 ```
 
-当前覆盖：假色块切框、徽章保留、大面积变化回退、中英 OCR、CLI 的 `textN=` / `kindN=`、thread 尺寸切框、左右气泡 → `in`/`out`、滚动检测、列表变化不录像、头像 average-hash、identities 绑定、时间线 JSON、`wechat-watch-gc` 过期删除、UTC/Asia/Shanghai 双时区、`wechat-watch-thread --png` 只读 OCR、左侧未读标记（红数字 / 红点 / `[N条]`）。
+当前覆盖：假色块切框、徽章保留、大面积变化回退、中英 OCR、CLI 的 `textN=` / `kindN=`、thread 尺寸切框、左右气泡 → `in`/`out`、滚动检测、列表变化不录像、头像 average-hash、identities 绑定、时间线 JSON、`wechat-watch-gc` 过期删除、UTC/Asia/Shanghai 双时区、`wechat-watch-thread --png` 只读 OCR、左侧未读标记（红数字 / 红点 / `[N条]`）、窗口 gutter 扫描（移动 vs 缩放 / DPI）。
 
 ## 运行时文件（不进 git）
 
@@ -288,7 +297,7 @@ wechat-watch/
 - 对方头像 average-hash 后和昵称绑在 `identities.json`，下次同一头像即使 OCR 失败也能补上名字
 - **限制**：切会话会让整块 thread 换内容，但那是列表变化，不会录像。快速连滑时变化面积超过裁区 40%，会退回整块再 OCR，而不是逐条气泡
 
-1280×800 上实测：会话列表和对话区的竖线在 x=412，输入框/工具条从 y=742 开始。thread 裁剪为 `720x660+414+40`，下沿停在输入框之上，避免闪烁光标和 dock。若窗口布局变了，以 `persist/watch/full.png` 为准改 `THREAD_*`。
+1280×800 上实测：会话列表和对话区的竖线在 x=412，输入框/工具条从 y=742 开始。thread 裁剪为 `720x660+414+40`，下沿停在输入框之上，避免闪烁光标和 dock。窗口不在 0,0 时 `--window-geom` 会按找到的窗口算裁剪；找不到仍用这些常量。有窗口 PNG 时扫描 gutter；其它 DPI / 缩放仍未处理，不能靠常量放大。
 
 单独复用切框脚本时请加 `--prefix t --label thread_ --emit-side`，不要复制一份差分逻辑。
 

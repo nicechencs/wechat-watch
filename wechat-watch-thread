@@ -162,6 +162,20 @@ case "$MODE" in
     ensure_thread_crop "$PNG" "$THREAD_READ"
     ;;
   grab)
+    # Live grab only: follow the found window. --png/--still keep constants
+    # so a pre-cropped 720x660 still matches. Fail → 1280x800 defaults.
+    if [ -n "${REGIONS_PY}" ] && command -v python3 >/dev/null 2>&1; then
+      _geom="$(python3 "$REGIONS_PY" --window-geom 2>/dev/null || true)"
+      if [ -n "${_geom}" ]; then
+        _thread="$(printf '%s\n' "$_geom" | awk -F= '/^thread=/{print $2; exit}')"
+        if printf '%s' "${_thread:-}" | grep -Eq '^-?[0-9]+,-?[0-9]+,[1-9][0-9]*,[1-9][0-9]*$'; then
+          IFS=',' read -r THREAD_X THREAD_Y THREAD_W THREAD_H <<EOF
+$_thread
+EOF
+        fi
+      fi
+      unset _geom _thread
+    fi
     FULL="$STATE_DIR/thread-read-full.png"
     "$FFMPEG" -hide_banner -loglevel error -y \
       -f x11grab -draw_mouse 0 -video_size "${FULL_W}x${FULL_H}" -i "${DISPLAY_NUM}.0" \

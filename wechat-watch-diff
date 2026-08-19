@@ -47,6 +47,7 @@ do
 done
 
 # Left chat list. Excludes compose + dock.
+# Defaults: maximized 1280x800. --window-geom overrides if it succeeds.
 CROP_W=440
 CROP_H=700
 CROP_X=70
@@ -60,6 +61,26 @@ THREAD_W=720
 THREAD_H=660
 THREAD_X=414
 THREAD_Y=40
+
+# Prefer live window rect (env / xwininfo / wmctrl). Keep constants if it fails.
+if [ -n "${REGIONS_PY}" ] && command -v python3 >/dev/null 2>&1; then
+  _geom="$(python3 "$REGIONS_PY" --window-geom 2>/dev/null || true)"
+  if [ -n "${_geom}" ]; then
+    _list="$(printf '%s\n' "$_geom" | awk -F= '/^list=/{print $2; exit}')"
+    _thread="$(printf '%s\n' "$_geom" | awk -F= '/^thread=/{print $2; exit}')"
+    if printf '%s' "${_list:-}" | grep -Eq '^-?[0-9]+,-?[0-9]+,[1-9][0-9]*,[1-9][0-9]*$'; then
+      IFS=',' read -r CROP_X CROP_Y CROP_W CROP_H <<EOF
+$_list
+EOF
+    fi
+    if printf '%s' "${_thread:-}" | grep -Eq '^-?[0-9]+,-?[0-9]+,[1-9][0-9]*,[1-9][0-9]*$'; then
+      IFS=',' read -r THREAD_X THREAD_Y THREAD_W THREAD_H <<EOF
+$_thread
+EOF
+    fi
+  fi
+  unset _geom _list _thread
+fi
 
 SCROLL_SECS="${WECHAT_SCROLL_SECS:-4}"
 SCROLL_FPS="${WECHAT_SCROLL_FPS:-4}"

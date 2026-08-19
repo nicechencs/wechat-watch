@@ -1206,5 +1206,322 @@ class NavIconTests(unittest.TestCase):
         )
 
 
+FAKE_XWININFO_TREE = """
+xwininfo: Window id: 0x15e (the root window) (has no name)
+
+  Root window id: 0x15e (the root window) (has no name)
+
+     4 children:
+     0x200007 "WeChat": ("wechat" "WeChat")  1019x736+130+6  +130+6
+        1 child:
+        0x200008 (has no name): ()  1019x736+0+0  +130+6
+     0x1600001 "Desktop": ("xfdesktop" "Xfdesktop")  1280x800+0+0  +0+0
+     0x1800022 "wechat-watch": ("gnome-terminal" "Gnome-terminal")  800x500+10+10  +10+10
+     0x1a00003 "Clock": ("clock" "Clock")  120x40+20+20  +20+20
+"""
+
+FAKE_WMCTRL_LG = """
+0x01600001  0 0    0    1280 800 box Desktop
+0x02000007  0 130  6    1019 736 box WeChat
+0x01800022  0 10   10   800  500 box wechat-watch
+0x01a00003  0 20   20   120  40  box Clock
+"""
+
+
+class WindowGeomTests(unittest.TestCase):
+    """Find-window helper: env, fake tree/wm dumps, desktop fallback. No live app."""
+
+    def test_parse_geom_spec_x11_and_csv(self):
+        self.assertEqual(regions.parse_geom_spec("1019x736+130+6"), (130, 6, 1019, 736))
+        self.assertEqual(regions.parse_geom_spec("1019x736-20+8"), (-20, 8, 1019, 736))
+        self.assertEqual(regions.parse_geom_spec("130,6,1019,736"), (130, 6, 1019, 736))
+        self.assertEqual(regions.parse_geom_spec(" 130, 6, 1019, 736 "), (130, 6, 1019, 736))
+        self.assertIsNone(regions.parse_geom_spec(""))
+        self.assertIsNone(regions.parse_geom_spec("not-a-geom"))
+        self.assertIsNone(regions.parse_geom_spec("0x0+0+0"))
+
+    def test_parse_root_tree_fake_string(self):
+        box = regions.parse_root_tree(FAKE_XWININFO_TREE)
+        self.assertEqual(box, (130, 6, 1019, 736))
+        self.assertIsNone(regions.parse_root_tree("no windows here"))
+        zh = '     0x200007 "微信": ("wechat" "WeChat")  900x700+40+20  +40+20\n'
+        self.assertEqual(regions.parse_root_tree(zh), (40, 20, 900, 700))
+
+    def test_parse_wm_geometry_fake_string(self):
+        box = regions.parse_wm_geometry(FAKE_WMCTRL_LG)
+        self.assertEqual(box, (130, 6, 1019, 736))
+        self.assertIsNone(regions.parse_wm_geometry("0x1 0 0 0 1280 800 box Desktop"))
+
+    def test_find_window_env_override(self):
+        win, source = regions.find_window(
+            env={"WECHAT_WINDOW": "200,40,900,700"},
+            tree_text=FAKE_XWININFO_TREE,
+            wm_text=FAKE_WMCTRL_LG,
+            probe=False,
+        )
+        self.assertEqual(win, (200, 40, 900, 700))
+        self.assertEqual(source, "env")
+        win2, src2 = regions.find_window(
+            env={"WECHAT_WINDOW": "900x700+40+20"},
+            tree_text=FAKE_XWININFO_TREE,
+            probe=False,
+        )
+        self.assertEqual(win2, (40, 20, 900, 700))
+        self.assertEqual(src2, "env")
+
+    def test_find_window_tree_then_wm(self):
+        win, source = regions.find_window(
+            env={},
+            tree_text=FAKE_XWININFO_TREE,
+            wm_text=FAKE_WMCTRL_LG,
+            probe=False,
+        )
+        self.assertEqual(win, (130, 6, 1019, 736))
+        self.assertEqual(source, "tree")
+        win2, src2 = regions.find_window(
+            env={},
+            tree_text="nothing matching",
+            wm_text=FAKE_WMCTRL_LG,
+            probe=False,
+        )
+        self.assertEqual(win2, (130, 6, 1019, 736))
+        self.assertEqual(src2, "wm")
+
+    def test_find_window_desktop_fallback(self):
+        win, source = regions.find_window(
+            env={},
+            tree_text="no WeChat here",
+            wm_text="",
+            probe=False,
+        )
+        self.assertEqual(win, (0, 0, 1280, 800))
+        self.assertEqual(source, "desktop")
+        crops = regions.window_crops(*win)
+        self.assertEqual(crops["list"], (70, 30, 440, 700))
+        self.assertEqual(crops["thread"], (414, 40, 720, 660))
+
+    def test_cli_window_geom_env(self):
+        env = {**os.environ, "WECHAT_WINDOW": "1019x736+130+6"}
+        proc = subprocess.run(
+            [sys.executable, SCRIPT, "--window-geom"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        parsed = _parse_unread_stdout(proc.stdout)
+        self.assertEqual(parsed.get("win"), "130,6,1019,736", proc.stdout)
+        self.assertEqual(parsed.get("source"), "env", proc.stdout)
+        for key in ("nav", "list", "thread"):
+            self.assertIn(key, parsed, proc.stdout)
+            parts = parsed[key].split(",")
+            self.assertEqual(len(parts), 4, parsed[key])
+            self.assertTrue(all(p.lstrip("-").isdigit() for p in parts), parsed[key])
+        crops = regions.window_crops(130, 6, 1019, 736)
+        self.assertEqual(parsed["nav"], regions.fmt_xywh(crops["nav"]))
+        self.assertEqual(parsed["list"], regions.fmt_xywh(crops["list"]))
+        self.assertEqual(parsed["thread"], regions.fmt_xywh(crops["thread"]))
+
+    def test_docs_mention_window_follow(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+            readme = fh.read()
+        self.assertIn("--window-geom", readme)
+        self.assertIn("WECHAT_WINDOW", readme)
+
+    def test_diff_and_thread_call_window_geom(self):
+        with open(os.path.join(ROOT, "wechat-watch-diff"), encoding="utf-8") as fh:
+            diff = fh.read()
+        with open(os.path.join(ROOT, "wechat-watch-thread"), encoding="utf-8") as fh:
+            thread = fh.read()
+        self.assertIn("--window-geom", diff)
+        self.assertIn("CROP_W=440", diff)
+        self.assertIn("--window-geom", thread)
+        self.assertIn("THREAD_W=720", thread)
+
+
+def write_three_pane_png(
+    path: str,
+    w: int,
+    h: int,
+    gutter1: int,
+    gutter2: int,
+    header_h: int,
+    footer_h: int,
+    badge_xy: tuple[int, int] | None = None,
+    ffmpeg: str = PERSIST_FFMPEG,
+) -> None:
+    """Three panes + 1px black gutters + header/footer; optional red badge box."""
+    list_w = max(1, gutter2 - gutter1 - 1)
+    parts = [
+        f"drawbox=x=0:y=0:w={gutter1}:h={h}:color=0x2D2D2D:t=fill",
+        f"drawbox=x={gutter1}:y=0:w=1:h={h}:color=black:t=fill",
+        f"drawbox=x={gutter1 + 1}:y=0:w={list_w}:h={h}:color=0xE8E8E8:t=fill",
+        f"drawbox=x={gutter2}:y=0:w=1:h={h}:color=black:t=fill",
+        f"drawbox=x=0:y=0:w={w}:h={header_h}:color=0x1A1A1A:t=fill",
+        f"drawbox=x=0:y={h - footer_h}:w={w}:h={footer_h}:color=0x1A1A1A:t=fill",
+    ]
+    if badge_xy is not None:
+        bx, by = badge_xy
+        parts.append(
+            f"drawbox=x={bx - 8}:y={by - 8}:w=16:h=16:color=0xFA5151:t=fill"
+        )
+    run_ffmpeg(
+        ffmpeg,
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=white:s={w}x{h}",
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            "-vf",
+            ",".join(parts),
+            path,
+        ],
+    )
+
+
+def _decode_png(path: str) -> tuple[bytes, int, int]:
+    w, h = regions.png_size(path)
+    with tempfile.TemporaryDirectory(prefix="wechat-watch-pane-dec-") as td:
+        rgb = regions.decode_rgb24(
+            PERSIST_FFMPEG, path, w, h, os.path.join(td, "a.rgb")
+        )
+    return rgb, w, h
+
+
+def _box_contains(box: tuple[int, int, int, int], px: int, py: int) -> bool:
+    x, y, bw, bh = box
+    return x <= px < x + bw and y <= py < y + bh
+
+
+class PaneDetectTests(unittest.TestCase):
+    """Scan window-local gutters; synthetic PNGs only. No live WeChat."""
+
+    def test_1280x800_three_pane_scan_and_badge(self):
+        self.assertTrue(os.path.isfile(PERSIST_FFMPEG), "persist ffmpeg missing")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-pane-a-") as td:
+            png = os.path.join(td, "win.png")
+            write_three_pane_png(
+                png, 1280, 800, gutter1=62, gutter2=411,
+                header_h=24, footer_h=70, badge_xy=(180, 100),
+            )
+            rgb, w, h = _decode_png(png)
+            panes = regions.detect_panes(rgb, w, h)
+            self.assertIsNotNone(panes, "expected gutters on three-pane 1280x800")
+            self.assertLessEqual(abs(panes["list_x"] - 63), 12, panes)
+            self.assertLessEqual(abs(panes["thread_x"] - 412), 16, panes)
+            crops = regions.window_crops(0, 0, 1280, 800, rgb=rgb, frame_w=w, frame_h=h)
+            self.assertTrue(_box_contains(crops["list"], 180, 100), crops)
+            self.assertFalse(_box_contains(crops["thread"], 180, 100), crops)
+
+    def test_900x600_different_gutters(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-pane-b-") as td:
+            png = os.path.join(td, "win.png")
+            write_three_pane_png(
+                png, 900, 600, gutter1=49, gutter2=250,
+                header_h=24, footer_h=60, badge_xy=(120, 90),
+            )
+            rgb, w, h = _decode_png(png)
+            panes = regions.detect_panes(rgb, w, h)
+            self.assertIsNotNone(panes, "expected gutters on 900x600")
+            self.assertLessEqual(abs(panes["list_x"] - 50), 12, panes)
+            self.assertLessEqual(abs(panes["thread_x"] - 251), 16, panes)
+            self.assertNotEqual(panes["thread_x"], 282, panes)
+            crops = regions.window_crops(0, 0, 900, 600, rgb=rgb, frame_w=w, frame_h=h)
+            self.assertTrue(_box_contains(crops["list"], 120, 90), crops)
+            self.assertFalse(_box_contains(crops["thread"], 120, 90), crops)
+            self.assertLessEqual(abs(crops["thread"][0] - 251), 16, crops)
+
+    def test_window_crops_translates_scanned_panes(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-pane-c-") as td:
+            png = os.path.join(td, "win.png")
+            write_three_pane_png(
+                png, 900, 600, gutter1=49, gutter2=250,
+                header_h=24, footer_h=60, badge_xy=(120, 90),
+            )
+            rgb, w, h = _decode_png(png)
+            panes = regions.detect_panes(rgb, w, h)
+            self.assertIsNotNone(panes)
+            crops = regions.window_crops(
+                10, 20, 900, 600, rgb=rgb, frame_w=w, frame_h=h
+            )
+            self.assertLessEqual(abs(crops["list"][0] - (10 + panes["list_x"])), 2, crops)
+            self.assertTrue(_box_contains(crops["list"], 10 + 120, 20 + 90), crops)
+            self.assertFalse(_box_contains(crops["thread"], 10 + 120, 20 + 90), crops)
+
+    def test_fallback_thread_width_follows_win_w(self):
+        a = regions.window_crops(130, 6, 800, 600)
+        b = regions.window_crops(130, 6, 1019, 736)
+        self.assertNotEqual(a["thread"][2], b["thread"][2], (a["thread"], b["thread"]))
+
+    def test_flat_white_returns_none(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-pane-e-") as td:
+            png = os.path.join(td, "white.png")
+            write_solid_png(png, 200, 200, "white")
+            rgb, w, h = _decode_png(png)
+            self.assertIsNone(regions.detect_panes(rgb, w, h))
+
+    def test_readme_mentions_move_resize_dpi_gutters(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+            readme = fh.read()
+        self.assertTrue("移动" in readme or "move" in readme.lower(), readme)
+        self.assertTrue(
+            "缩放" in readme or "resize" in readme.lower() or "DPI" in readme,
+            readme,
+        )
+        self.assertTrue("gutter" in readme.lower() or "分隔" in readme, readme)
+
+    def test_maximized_without_rgb_keeps_list_crop(self):
+        crops = regions.window_crops(0, 0, 1280, 800)
+        self.assertEqual(crops["list"], (70, 30, 440, 700))
+        self.assertEqual(crops["thread"], (414, 40, 720, 660))
+
+    def test_cli_window_png_missing_exits_2(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                SCRIPT,
+                "--window-geom",
+                "--window-png",
+                "/no/such/window.png",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+
+    def test_cli_window_png_scans_gutters(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-pane-cli-") as td:
+            png = os.path.join(td, "win.png")
+            write_three_pane_png(
+                png, 900, 600, gutter1=49, gutter2=250,
+                header_h=24, footer_h=60, badge_xy=(120, 90),
+            )
+            env = {**os.environ, "WECHAT_WINDOW": "900x600+0+0"}
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "--window-geom",
+                    "--window-png",
+                    png,
+                    "--ffmpeg",
+                    PERSIST_FFMPEG,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            parsed = _parse_unread_stdout(proc.stdout)
+            self.assertEqual(parsed.get("win"), "0,0,900,600", proc.stdout)
+            tx = int(parsed["thread"].split(",")[0])
+            self.assertLessEqual(abs(tx - 251), 16, parsed)
+            self.assertNotEqual(tx, 282, parsed)
+
+
 if __name__ == "__main__":
     unittest.main()
