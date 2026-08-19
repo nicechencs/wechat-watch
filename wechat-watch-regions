@@ -3,11 +3,13 @@
 
 Decode two PNGs to raw rgb24 via persist ffmpeg (no Pillow). Find bounding
 boxes of changed pixels and write small crops plus regions.json so an agent
-can Read only the slices that changed.
+can Read only the slices that changed. After each rN.png, run tesseract
+(chi_sim+eng) so CHANGED text regions emit plain text (no vision needed).
 
 Usage:
   wechat-watch-regions --prev PREV.png --curr CURR.png \\
       --out-dir REGIONS_DIR --json OUT.json [--ffmpeg PATH]
+  wechat-watch-regions --full LIST.png --out-dir REGIONS_DIR --json OUT.json
 """
 from __future__ import annotations
 
@@ -27,6 +29,23 @@ BADGE_MIN = 12
 BADGE_LEFT = 80
 MAX_BOXES = 6
 AREA_CAP = 0.40
+
+PERSIST_TESSDATA = "/home/box/.local/share/wechat-persist/tessdata"
+SHORT_H = 48
+SHORT_W = 96
+OCR_TIMEOUT = 30
+
+# CJK Unified Ideographs + common extensions / compatibility (not punctuation).
+_CJK_RANGES = (
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xF900, 0xFAFF),
+    (0x20000, 0x2A6DF),
+    (0x2A700, 0x2B73F),
+    (0x2B740, 0x2B81F),
+    (0x2B820, 0x2CEAF),
+    (0x30000, 0x3134F),
+)
 
 
 def png_size(path: str) -> tuple[int, int]:
@@ -58,7 +77,8 @@ def decode_rgb24(ffmpeg: str, path: str, w: int, h: int, raw_path: str) -> bytes
         raw_path,
     ]
     subprocess.run(cmd, check=True)
-    data = open(raw_path, "rb").read()
+    with open(raw_path, "rb") as rf:
+        data = rf.read()
     expect = w * h * 3
     if len(data) != expect:
         raise ValueError(f"{path}: raw size {len(data)} != {expect} ({w}x{h} rgb24)")
@@ -241,6 +261,114 @@ def crop_png(ffmpeg: str, src: str, dest: str, box: tuple[int, int, int, int]) -
     subprocess.run(cmd, check=True)
 
 
+def is_cjk(ch: str) -> bool:
+    o = ord(ch)
+    return any(lo <= o <= hi for lo, hi in _CJK_RANGES)
+
+
+def classify_ocr(raw: str) -> tuple[str, str]:
+    """Return (kind, text). TEXT needs 1 CJK or 2+ alnum after strip."""
+    text = (raw or "").strip()
+    if len(text) < 1:
+        return "image", ""
+    n_cjk = 0
+    n_alnum = 0
+    for ch in text:
+        if is_cjk(ch):
+            n_cjk += 1
+        elif ch.isalnum():
+            n_alnum += 1
+    if n_cjk >= 1 or n_alnum >= 2:
+        return "text", text
+    return "image", ""
+
+
+def find_tesseract() -> str:
+    env = os.environ.get("WECHAT_TESSERACT")
+    if env and os.path.isfile(env) and os.access(env, os.X_OK):
+        return env
+    if os.path.isfile("/usr/bin/tesseract") and os.access("/usr/bin/tesseract", os.X_OK):
+        return "/usr/bin/tesseract"
+    return "tesseract"
+
+
+def tessdata_dir() -> str:
+    """Prefer persist/tessdata (TESSDATA_PREFIX). Fall back to system packs."""
+    env = os.environ.get("TESSDATA_PREFIX")
+    candidates = []
+    if env:
+        candidates.append(env)
+        candidates.append(os.path.join(env, "tessdata"))
+    candidates.append(PERSIST_TESSDATA)
+    candidates.extend(
+        (
+            "/usr/share/tesseract-ocr/5/tessdata",
+            "/usr/share/tesseract-ocr/4.00/tessdata",
+            "/usr/share/tessdata",
+        )
+    )
+    for d in candidates:
+        if d and os.path.isfile(os.path.join(d, "chi_sim.traineddata")):
+            return d
+    return PERSIST_TESSDATA
+
+
+def pick_psm(box: tuple[int, int, int, int]) -> int:
+    """psm 7 for short / badge-like boxes; psm 6 for a uniform text block.
+
+    Do not use is_badge() here: a full-crop box starts at x=0 and would
+    otherwise be treated as a badge (psm 7 on a 440x700 frame yields empty).
+    """
+    _x, _y, bw, bh = box
+    if bh <= SHORT_H:
+        return 7
+    # Compact badge / chip, not a tall strip.
+    if bw <= SHORT_W and bh <= SHORT_H * 2:
+        return 7
+    return 6
+
+
+def ocr_png(path: str, box: tuple[int, int, int, int] | None = None) -> tuple[str, str]:
+    """Run tesseract chi_sim+eng on a crop. Returns (text, kind)."""
+    if box is None:
+        try:
+            w, h = png_size(path)
+            box = (0, 0, w, h)
+        except (OSError, ValueError):
+            box = (0, 0, 0, 0)
+    psm = pick_psm(box)
+    tess = find_tesseract()
+    data_dir = tessdata_dir()
+    env = os.environ.copy()
+    # Tesseract 5: TESSDATA_PREFIX is the directory that holds *.traineddata.
+    env["TESSDATA_PREFIX"] = data_dir
+    cmd = [
+        tess,
+        path,
+        "stdout",
+        "-l",
+        "chi_sim+eng",
+        "--psm",
+        str(psm),
+        "--tessdata-dir",
+        data_dir,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=OCR_TIMEOUT,
+        )
+        raw = proc.stdout or ""
+    except (OSError, subprocess.TimeoutExpired):
+        return "", "image"
+    kind, text = classify_ocr(raw)
+    return text, kind
+
+
 def compute_regions(
     prev_path: str,
     curr_path: str,
@@ -287,6 +415,29 @@ def compute_regions(
     return (boxes, w, h, changed_n)
 
 
+def write_json(recs: list[dict], json_path: str) -> None:
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(recs, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def emit_region_stdout(recs: list[dict]) -> None:
+    print(f"regions={len(recs)}")
+    for rec in recs:
+        print(f"region={rec['path']}")
+    for i, rec in enumerate(recs):
+        kind = rec.get("kind", "image")
+        if kind == "text":
+            esc = (
+                rec.get("text", "")
+                .replace("\r\n", "\\n")
+                .replace("\n", "\\n")
+                .replace("\r", "\\n")
+            )
+            print(f"text{i}={esc}")
+        print(f"kind{i}={kind}")
+
+
 def write_outputs(
     boxes: list[tuple[int, int, int, int]],
     curr_path: str,
@@ -294,6 +445,7 @@ def write_outputs(
     json_path: str,
     ffmpeg: str,
     full_fallback: bool = False,
+    ocr: bool = True,
 ) -> list[dict]:
     os.makedirs(out_dir, exist_ok=True)
     # Drop stale rN.png from a previous CHANGED.
@@ -315,36 +467,75 @@ def write_outputs(
         x, y, bw, bh = box
         # Full-crop box: still write r0.png (copy via ffmpeg crop of whole frame).
         crop_png(ffmpeg, curr_path, dest, box)
-        recs.append(
-            {
-                "x": int(x),
-                "y": int(y),
-                "w": int(bw),
-                "h": int(bh),
-                "path": dest,
-            }
-        )
+        rec: dict = {
+            "x": int(x),
+            "y": int(y),
+            "w": int(bw),
+            "h": int(bh),
+            "path": dest,
+        }
+        if ocr:
+            text, kind = ocr_png(dest, box)
+            rec["text"] = text
+            rec["kind"] = kind
+        recs.append(rec)
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(recs, f, indent=2)
-        f.write("\n")
+    write_json(recs, json_path)
     return recs
 
 
+def annotate_full(full_path: str, json_path: str, ocr: bool = True) -> list[dict]:
+    """One region = this png (no recrop). Used on first run / helper fallback."""
+    w, h = png_size(full_path)
+    rec: dict = {"x": 0, "y": 0, "w": int(w), "h": int(h), "path": full_path}
+    if ocr:
+        text, kind = ocr_png(full_path, (0, 0, w, h))
+        rec["text"] = text
+        rec["kind"] = kind
+    recs = [rec]
+    parent = os.path.dirname(json_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    write_json(recs, json_path)
+    return recs
+
+
+def default_ffmpeg() -> str:
+    return os.environ.get(
+        "WECHAT_FFMPEG",
+        "/home/box/.local/share/wechat-persist/bin/ffmpeg",
+    )
+
+
+def resolve_ffmpeg(ffmpeg: str) -> str:
+    if os.path.isfile(ffmpeg) and os.access(ffmpeg, os.X_OK):
+        return ffmpeg
+    return "ffmpeg"
+
+
 def main() -> int:
-    p = argparse.ArgumentParser(description="WeChat list.png region crops")
-    p.add_argument("--prev", required=True, help="previous list.png")
-    p.add_argument("--curr", required=True, help="current list.png")
+    p = argparse.ArgumentParser(description="WeChat list.png region crops + OCR")
+    p.add_argument("--prev", help="previous list.png")
+    p.add_argument("--curr", help="current list.png")
+    p.add_argument(
+        "--full",
+        help="skip diff; treat this png as the single full region (no recrop)",
+    )
     p.add_argument("--out-dir", required=True, help="directory for rN.png crops")
     p.add_argument("--json", required=True, help="regions.json path")
-    p.add_argument(
-        "--ffmpeg",
-        default=os.environ.get(
-            "WECHAT_FFMPEG",
-            "/home/box/.local/share/wechat-persist/bin/ffmpeg",
-        ),
-    )
+    p.add_argument("--ffmpeg", default=default_ffmpeg())
     args = p.parse_args()
+
+    if args.full:
+        if not os.path.isfile(args.full):
+            print(f"ERROR: full png missing: {args.full}", file=sys.stderr)
+            return 2
+        recs = annotate_full(args.full, args.json)
+        emit_region_stdout(recs)
+        return 0
+
+    if not args.prev or not args.curr:
+        p.error("--prev and --curr are required unless --full is set")
 
     if not os.path.isfile(args.prev):
         print(f"ERROR: prev missing: {args.prev}", file=sys.stderr)
@@ -352,19 +543,14 @@ def main() -> int:
     if not os.path.isfile(args.curr):
         print(f"ERROR: curr missing: {args.curr}", file=sys.stderr)
         return 2
-    ffmpeg = args.ffmpeg
-    if not os.path.isfile(ffmpeg) or not os.access(ffmpeg, os.X_OK):
-        # Fall back to PATH ffmpeg.
-        ffmpeg = "ffmpeg"
+    ffmpeg = resolve_ffmpeg(args.ffmpeg)
 
     boxes, _w, _h, _n = compute_regions(args.prev, args.curr, ffmpeg)
     if not boxes:
         w, h = png_size(args.curr)
         boxes = [(0, 0, w, h)]
     recs = write_outputs(boxes, args.curr, args.out_dir, args.json, ffmpeg)
-    print(f"regions={len(recs)}")
-    for rec in recs:
-        print(f"region={rec['path']}")
+    emit_region_stdout(recs)
     return 0
 
 

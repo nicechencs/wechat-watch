@@ -6,6 +6,8 @@
 regions.json
 watch/
 bin/
+tessdata/
+*.traineddata
 __pycache__/
 *.pyc
 .pytest_cache/

@@ -2,7 +2,7 @@
 # Cheap WeChat change detector: capture screen, crop chat list, compare hash.
 # Prints UNCHANGED or CHANGED. Never sends the image to a model.
 # Crop excludes the right compose pane (blinking cursor) and the dock.
-# On CHANGED, also write region crops of rectangles that actually differ.
+# On CHANGED, write region crops and OCR each slice (chi_sim+eng).
 set -euo pipefail
 
 DISPLAY_NUM="${DISPLAY:-:8}"
@@ -15,6 +15,8 @@ PREV_HASH_FILE="$STATE_DIR/list.sha256"
 REGIONS_DIR="$STATE_DIR/regions"
 REGIONS_JSON="$STATE_DIR/regions.json"
 PERSIST_FFMPEG="$PERSIST/bin/ffmpeg"
+# Prefer persist tessdata (survives reset) over the apt default path.
+export TESSDATA_PREFIX="${TESSDATA_PREFIX:-$PERSIST/tessdata}"
 # Prefer the git-repo helper; fall back to persist copy.
 REGIONS_PY=""
 for cand in \
@@ -91,18 +93,30 @@ echo "at=$NOW"
 echo "list=$CROP"
 
 emit_full_region() {
-  # First run, or helper unavailable: one region = the full crop.
+  # First run, or helper unavailable: one region = the full crop (+ OCR).
   mkdir -p "$REGIONS_DIR"
+  if [ -n "$REGIONS_PY" ] && command -v python3 >/dev/null 2>&1; then
+    if WECHAT_FFMPEG="$FFMPEG" python3 "$REGIONS_PY" \
+      --full "$CROP" \
+      --out-dir "$REGIONS_DIR" \
+      --json "$REGIONS_JSON" \
+      --ffmpeg "$FFMPEG"
+    then
+      return 0
+    fi
+    echo "WARNING: full-region OCR helper failed; emitting path only" >&2
+  fi
   python3 - "$REGIONS_JSON" "$CROP" "$CROP_W" "$CROP_H" << 'PY'
 import json, sys
 json_path, crop, w, h = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-recs = [{"x": 0, "y": 0, "w": w, "h": h, "path": crop}]
+recs = [{"x": 0, "y": 0, "w": w, "h": h, "path": crop, "text": "", "kind": "image"}]
 with open(json_path, "w", encoding="utf-8") as f:
     json.dump(recs, f, indent=2)
     f.write("\n")
 PY
   echo "regions=1"
   echo "region=$CROP"
+  echo "kind0=image"
 }
 
 if [ "$HAD_PREV" -eq 0 ]; then
