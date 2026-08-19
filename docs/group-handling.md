@@ -49,7 +49,7 @@
 ### 各脚本
 
 - **`wechat-watch-diff`**：只哈希左侧列表。列表变化**不会**开始录像。录像只在右侧对话区判定为滚动时启动。
-- **`wechat-watch-regions`**：区域差分 + `chi_sim+eng` OCR；`--detect-scroll`；`--parse-frames` 写出 `{t,side,name,avatar_hash,text}`；`--ocr-still` 识别一张已裁好的对话区；`--format-time` 打出 UTC / Asia/Shanghai；`--detect-unread LIST.png` 扫左侧列表的鲜红圆标 / 红点 / `[N条]` / `@` / 单独的 `z`（只读，不点击）。群聊气泡上方昵称用 `--extra-top-pad 22`，左右气泡用 `--emit-side`（`in` / `out`）。列表哈希仍是廉价信号；`--detect-unread` 只告诉你哪一行有未读标记，列表预览仍然不是群记录。
+- **`wechat-watch-regions`**：区域差分 + `chi_sim+eng` OCR；`--detect-scroll`；`--parse-frames` 写出 `{t,side,name,avatar_hash,text}`；`--ocr-still` 识别一张已裁好的对话区；`--format-time` 打出 UTC / Asia/Shanghai；`--detect-unread LIST.png` 扫左侧列表的鲜红圆标 / 红点 / `[N条]` / `@` / 单独的 `z`（只读，不点击）。`--detect-nav NAV.png` 扫左侧导航图标红数字 / 红点（只读）。群聊气泡上方昵称用 `--extra-top-pad 22`，左右气泡用 `--emit-side`（`in` / `out`）。列表哈希仍是廉价信号；`--detect-unread` 只告诉你哪一行有未读标记，列表预览仍然不是群记录。
 - **`wechat-watch-thread`**：只读助手。对当前 `DISPLAY`（默认 `:8`）截屏，裁右侧 `720x660+414+40`，调用 `--ocr-still`，把 `thread_textN=` 打到 stdout，供 agent 写进 summaries。可用 `--png` 识别已有图（整屏会先裁对话区）。**不点击、不打字、不发送。**
 - **身份表**：对方头像 average-hash 写入 `persist/watch/identities.json`（名字↔哈希）。下次同一头像即使 OCR 失败也能补昵称。
 - **`wechat-watch-gc`**：解析完成后删录像和抽帧；`regions` / `thread-regions` 小块 15 分钟过期；头像 7 天；`list.png` / `thread.png` / `identities.json` 保留。每次 diff / thread 跑完会带一次 GC。
@@ -93,4 +93,7 @@ export DISPLAY="${DISPLAY:-:8}"
 
 # 哪一行有红数字 / 红点 / [N条]（只读；列表预览仍不是群记录）
 ./wechat-watch-regions --detect-unread "$WECHAT_PERSIST/watch/list.png"
+
+# 左侧导航图标红点 / 数字（只读）
+./wechat-watch-regions --detect-nav "$WECHAT_PERSIST/watch/full.png"
 ```

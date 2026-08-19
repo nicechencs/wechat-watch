@@ -1102,5 +1102,109 @@ class UnreadMarkerTests(unittest.TestCase):
             self.assertEqual(recs, [])
 
 
+class NavIconTests(unittest.TestCase):
+    """Left-nav icon slots + red badge/dot. Icon-only; no glyph OCR."""
+
+    def test_blank_nav_has_no_badges(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-nav-b-") as td:
+            png = os.path.join(td, "nav.png")
+            write_solid_png(png, 62, 736, "white")
+            recs = regions.detect_nav(png, PERSIST_FFMPEG)
+            self.assertEqual(len(recs), len(regions.NAV_SLOTS))
+            self.assertEqual([r["id"] for r in recs], [s[0] for s in regions.NAV_SLOTS])
+            for rec in recs:
+                self.assertEqual(rec["badge"], "none", rec)
+                self.assertEqual(rec["count"], 0)
+                self.assertNotIn(rec["badge"], ("number", "dot"))
+
+    def test_chat_red_circle_digit(self):
+        self.assertTrue(os.path.isfile(SYSTEM_FFMPEG), "system ffmpeg missing")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-nav-n-") as td:
+            png = os.path.join(td, "nav.png")
+            write_red_circle_png(
+                png, 62, 736, cx=38, cy=88, radius=8, digit="4", fontsize=12
+            )
+            recs = regions.detect_nav(png, PERSIST_FFMPEG)
+            chat = next(r for r in recs if r["id"] == "chat" or r["name"] == "chat")
+            self.assertEqual(chat["badge"], "number", recs)
+            self.assertEqual(chat["count"], 4)
+
+    def test_chat_small_red_dot(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-nav-d-") as td:
+            png = os.path.join(td, "nav.png")
+            write_red_circle_png(png, 62, 736, cx=38, cy=88, radius=4, digit=None)
+            recs = regions.detect_nav(png, PERSIST_FFMPEG)
+            chat = next(r for r in recs if r["id"] == "chat" or r["name"] == "chat")
+            self.assertEqual(chat["badge"], "dot", recs)
+            self.assertEqual(chat["count"], 0)
+
+    def test_cli_detect_nav(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-nav-cli-") as td:
+            png = os.path.join(td, "nav.png")
+            write_solid_png(png, 62, 736, "white")
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "--detect-nav",
+                    png,
+                    "--ffmpeg",
+                    PERSIST_FFMPEG,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            parsed = _parse_unread_stdout(proc.stdout)
+            self.assertIn("nav_slots", parsed, proc.stdout)
+            self.assertEqual(int(parsed["nav_slots"]), 10, proc.stdout)
+            self.assertEqual(parsed.get("nav0_id"), "avatar", proc.stdout)
+            self.assertEqual(parsed.get("nav1_id"), "chat", proc.stdout)
+            self.assertEqual(parsed.get("nav0_badge"), "none", proc.stdout)
+            self.assertEqual(parsed.get("nav0_count"), "0", proc.stdout)
+            for i in range(10):
+                for key in ("id", "badge", "count", "x", "y", "w", "h"):
+                    self.assertIn(f"nav{i}_{key}", parsed, proc.stdout)
+
+    def test_window_crops_floating(self):
+        crops = regions.window_crops(130, 6, 1019, 736)
+        nx, _ny, nw, _nh = crops["nav"]
+        lx, _ly, _lw, _lh = crops["list"]
+        tx, _ty, _tw, _th = crops["thread"]
+        self.assertGreaterEqual(nx, 128)
+        self.assertLessEqual(nx, 135)
+        self.assertGreaterEqual(lx, 190)
+        self.assertLessEqual(lx, 196)
+        self.assertGreaterEqual(tx, 408)
+        self.assertLessEqual(tx, 416)
+        self.assertTrue(50 <= nw <= 70)
+
+    def test_window_crops_maximized(self):
+        crops = regions.window_crops(0, 0, 1280, 800)
+        lx, ly, lw, lh = crops["list"]
+        self.assertEqual((lx, ly), (70, 30))
+        self.assertEqual((lw, lh), (440, 700))
+
+    def test_nav_source_box(self):
+        box = regions.nav_source_box(1280, 800)
+        self.assertIsNotNone(box)
+        x, _y, w, _h = box
+        self.assertLessEqual(abs(x - 0), 2)
+        self.assertTrue(50 <= w <= 70)
+        self.assertIsNone(regions.nav_source_box(62, 736))
+        self.assertIsNone(regions.nav_source_box(200, 100))
+
+    def test_docs_mention_detect_nav(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+            readme = fh.read()
+        doc_path = os.path.join(ROOT, "docs", "group-handling.md")
+        with open(doc_path, encoding="utf-8") as fh:
+            doc = fh.read()
+        self.assertTrue(
+            "--detect-nav" in readme or "--detect-nav" in doc,
+            "README.md and/or docs/group-handling.md must mention --detect-nav",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

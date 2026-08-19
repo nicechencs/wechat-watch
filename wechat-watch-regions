@@ -22,6 +22,7 @@ Usage:
   wechat-watch-regions --format-time [--when ISO8601]
   wechat-watch-regions --ocr-still THREAD.png [--json OUT.json] [--when ISO8601]
   wechat-watch-regions --detect-unread LIST.png   # red badge / dot / [N条] (read-only)
+  wechat-watch-regions --detect-nav NAV.png       # left-nav icon badges (read-only)
 """
 from __future__ import annotations
 
@@ -65,9 +66,33 @@ THUMB_MOVE_MIN = 4.0
 IDENTITIES_VERSION = 1
 
 # 1280x800 WeChat 4.1 geometry (w, h, x, y). List hash + thread scroll use these.
+# Maximized-window fallback; floating windows use window_crops() instead.
 LIST_CROP = (440, 700, 70, 30)
 THREAD_CROP = (720, 660, 414, 40)
 FULL_DESKTOP = (1280, 800)
+
+# Left nav strip (window-client coords). No dedicated Files slot.
+NAV_W = 62
+NAV_INSET = 1
+LIST_INSET = 63
+THREAD_INSET = 282
+NAV_STRIP_W_MIN = 50
+NAV_STRIP_W_MAX = 80
+NAV_WINDOW_MIN_H = 400
+NAV_ICON_SIDE = 32
+# Measured icon-center y / 736 on Linux WeChat 4.1 (floating 1019x736).
+NAV_SLOTS: tuple[tuple[str, float], ...] = (
+    ("avatar", 42 / 736),
+    ("chat", 98 / 736),
+    ("contacts", 149 / 736),
+    ("favorites", 198 / 736),
+    ("moments", 248 / 736),
+    ("channels", 298 / 736),
+    ("search", 349 / 736),
+    ("miniprograms", 398 / 736),
+    ("mobile", 648 / 736),
+    ("menu", 698 / 736),
+)
 
 # Left-list unread markers (WeChat 4.1 red badge / muted dot / [N条]).
 RED_R_MIN = 200
@@ -1584,6 +1609,121 @@ def emit_unread_stdout(recs: list[dict]) -> None:
         print(f"unread{i}_name={rec.get('name') or ''}")
 
 
+def nav_source_box(w: int, h: int) -> tuple[int, int, int, int] | None:
+    """Crop the left nav strip from a desktop or window PNG. Else whole PNG."""
+    if (w, h) == FULL_DESKTOP:
+        return (0, 0, NAV_W, h)
+    if NAV_STRIP_W_MIN <= w <= NAV_STRIP_W_MAX:
+        return None
+    if w > NAV_STRIP_W_MAX and h >= NAV_WINDOW_MIN_H:
+        return (0, 0, min(NAV_W, w), h)
+    return None
+
+
+def window_crops(
+    win_x: int, win_y: int, win_w: int, win_h: int
+) -> dict[str, tuple[int, int, int, int]]:
+    """Nav / list / thread boxes in desktop coords for a WeChat window."""
+    if (win_x, win_y, win_w, win_h) == (0, 0, *FULL_DESKTOP):
+        lw, lh, lx, ly = LIST_CROP
+        tw, th, tx, ty = THREAD_CROP
+        return {
+            "nav": (0, 0, NAV_W, FULL_DESKTOP[1]),
+            "list": (lx, ly, lw, lh),
+            "thread": (tx, ty, tw, th),
+        }
+    nav_x = win_x + NAV_INSET
+    list_x = win_x + LIST_INSET
+    thread_x = win_x + THREAD_INSET
+    nav_w = min(NAV_W, max(1, win_w - NAV_INSET))
+    list_w = max(1, thread_x - list_x)
+    thread_w = max(1, win_x + win_w - thread_x)
+    return {
+        "nav": (nav_x, win_y, nav_w, win_h),
+        "list": (list_x, win_y, list_w, win_h),
+        "thread": (thread_x, win_y, thread_w, win_h),
+    }
+
+
+def _nav_icon_box(y_frac: float, w: int, h: int) -> tuple[int, int, int, int]:
+    side = min(NAV_ICON_SIDE, max(1, w), max(1, h))
+    cx = w // 2
+    cy = int(round(y_frac * h))
+    x = max(0, min(w - side, cx - side // 2))
+    y = max(0, min(h - side, cy - side // 2))
+    return (x, y, min(side, w - x), min(side, h - y))
+
+
+def _nearest_nav_slot(cy: float, h: int) -> int:
+    best_i = 0
+    best_d = abs(NAV_SLOTS[0][1] * h - cy)
+    for i, (_sid, y_frac) in enumerate(NAV_SLOTS[1:], start=1):
+        d = abs(y_frac * h - cy)
+        if d < best_d:
+            best_d = d
+            best_i = i
+    return best_i
+
+
+def detect_nav(path: str, ffmpeg: str) -> list[dict]:
+    """Read-only: red number / red dot on left-nav icons, mapped by vertical slot."""
+    w, h = png_size(path)
+    with tempfile.TemporaryDirectory(prefix="wechat-watch-nav-") as td:
+        src = path
+        crop_box = nav_source_box(w, h)
+        if crop_box is not None:
+            src = os.path.join(td, "nav-crop.png")
+            crop_png(ffmpeg, path, src, crop_box)
+            w, h = crop_box[2], crop_box[3]
+        rgb = decode_rgb24(ffmpeg, src, w, h, os.path.join(td, "nav.rgb"))
+        assigned: list[tuple[int, int, int, int] | None] = [None] * len(NAV_SLOTS)
+        counts = [0] * len(NAV_SLOTS)
+        for x, y, bw, bh, _n in red_clusters(rgb, w, h):
+            box = (x, y, bw, bh)
+            idx = _nearest_nav_slot(y + bh / 2.0, h)
+            count = ocr_badge_count(ffmpeg, src, box, w, h, td)
+            prev = assigned[idx]
+            if prev is None or (count > 0 and counts[idx] == 0):
+                assigned[idx] = box
+                counts[idx] = count
+        recs: list[dict] = []
+        for i, (sid, y_frac) in enumerate(NAV_SLOTS):
+            box = assigned[i] if assigned[i] is not None else _nav_icon_box(y_frac, w, h)
+            count = counts[i]
+            if assigned[i] is None:
+                badge = "none"
+            elif count > 0:
+                badge = "number"
+            else:
+                badge = "dot"
+            x, y, bw, bh = box
+            recs.append(
+                {
+                    "id": sid,
+                    "name": sid,
+                    "badge": badge,
+                    "count": int(count or 0),
+                    "x": int(x),
+                    "y": int(y),
+                    "w": int(bw),
+                    "h": int(bh),
+                }
+            )
+    return recs
+
+
+def emit_nav_stdout(recs: list[dict]) -> None:
+    print(f"nav_slots={len(recs)}")
+    for i, rec in enumerate(recs):
+        print(f"nav{i}_id={rec.get('id', '')}")
+        print(f"nav{i}_badge={rec.get('badge', 'none')}")
+        print(f"nav{i}_count={int(rec.get('count') or 0)}")
+        print(f"nav{i}_x={int(rec.get('x') or 0)}")
+        print(f"nav{i}_y={int(rec.get('y') or 0)}")
+        print(f"nav{i}_w={int(rec.get('w') or 0)}")
+        print(f"nav{i}_h={int(rec.get('h') or 0)}")
+
+
 def default_ffmpeg() -> str:
     return os.environ.get(
         "WECHAT_FFMPEG",
@@ -1685,6 +1825,11 @@ def main() -> int:
         metavar="LIST.png",
         help="read-only: red badge / red dot / [N条] / @ / z on the left chat list",
     )
+    p.add_argument(
+        "--detect-nav",
+        metavar="NAV.png",
+        help="read-only: red badge / red dot on left-nav icons (by vertical slot)",
+    )
     args = p.parse_args()
 
     if args.format_time:
@@ -1705,6 +1850,15 @@ def main() -> int:
         ffmpeg = resolve_ffmpeg(args.ffmpeg)
         recs = detect_unread(args.detect_unread, ffmpeg)
         emit_unread_stdout(recs)
+        return 0
+
+    if args.detect_nav:
+        if not os.path.isfile(args.detect_nav):
+            print(f"ERROR: nav png missing: {args.detect_nav}", file=sys.stderr)
+            return 2
+        ffmpeg = resolve_ffmpeg(args.ffmpeg)
+        recs = detect_nav(args.detect_nav, ffmpeg)
+        emit_nav_stdout(recs)
         return 0
 
     if args.should_record:
@@ -1771,7 +1925,7 @@ def main() -> int:
         return 0
 
     if not args.prev or not args.curr:
-        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread")
+        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread / --detect-nav")
     if not args.out_dir or not args.json:
         p.error("--out-dir and --json are required unless --detect-scroll / --parse-frames / --should-record")
 

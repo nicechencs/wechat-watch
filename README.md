@@ -174,6 +174,9 @@ kind1=image
 
 # 列表未读标记（只读，不点击）：哪一行有红数字 / 红点 / [N条]
 ./wechat-watch-regions --detect-unread "$WECHAT_PERSIST/watch/list.png"
+
+# 左侧导航图标红点 / 数字（只读，不点图标）
+./wechat-watch-regions --detect-nav "$WECHAT_PERSIST/watch/full.png"
 ```
 
 ## 区域差分规则
@@ -215,6 +218,8 @@ unread0_name=独立产品创业
 ```
 
 不点击、不打字、不发送。列表预览仍然**不是**群记录；群内容以右侧对话区为准（见 [docs/group-handling.md](docs/group-handling.md)）。
+
+`--detect-nav` 同样只读：按竖直槽位标左侧导航图标上的红数字 / 红点（无独立「文件」槽）。窗口不在桌面 0,0 时仍可裁。
 
 ## OCR 规则
 
