@@ -9,8 +9,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 SCRIPT = os.path.join(ROOT, "wechat-watch-regions")
 PERSIST_FFMPEG = "/home/box/.local/share/wechat-persist/bin/ffmpeg"
 SYSTEM_FFMPEG = "/usr/bin/ffmpeg"
@@ -2754,6 +2757,35 @@ class SendHelperTests(unittest.TestCase):
             rec = self._last_json(proc.stdout)
             self.assertFalse(rec["ok"])
             self.assertEqual(rec["error"], "group")
+
+    def test_dry_run_never_calls_apply(self):
+        with patch("wechat_watch_apply.apply_private_text") as apply:
+            apply.return_value = True
+            result = regions.run_send(
+                "阿坤",
+                "好",
+                sessions=[{"name": "阿坤", "row": 1}],
+                dry_run=True,
+                probe_window=False,
+            )
+            self.assertTrue(result["ok"])
+            self.assertTrue(result.get("dry_run"))
+            apply.assert_not_called()
+
+    def test_stub_apply_invoked_once(self):
+        with patch("wechat_watch_apply.apply_private_text") as apply:
+            apply.return_value = True
+            result = regions.run_send(
+                "阿坤",
+                "好",
+                sessions=[{"name": "阿坤", "row": 1}],
+                dry_run=False,
+                probe_window=False,
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["peer"], "阿坤")
+            self.assertEqual(result["text"], "好")
+            apply.assert_called_once_with("阿坤", "好")
 
     def test_apply_source_submits_after_fill(self):
         path = os.path.join(ROOT, "wechat_watch_apply.py")
