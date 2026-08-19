@@ -463,6 +463,32 @@ class GcTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(newest_full))
             self.assertFalse(os.path.isfile(extra_full), "older full*.png must go")
 
+    def test_gc_excludes_images_from_leftover_keeps_sidecar(self):
+        """15-min leftover must not wipe */images/*; 7-day expire may drop png only."""
+        self.assertTrue(os.path.isfile(self.GC), "wechat-watch-gc missing")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-gc-img-") as td:
+            recent = os.path.join(td, "images", "abc.png")
+            self._touch_old(recent, 20)
+            recent_side = os.path.join(td, "images", "abc.json")
+            with open(recent_side, "w", encoding="utf-8") as f:
+                f.write("{}")
+            old = os.path.join(td, "images", "old.png")
+            self._touch_old(old, 8 * 24 * 60)
+            old_side = os.path.join(td, "images", "old.json")
+            with open(old_side, "w", encoding="utf-8") as f:
+                f.write("{}")
+            subprocess.run(
+                ["bash", self.GC],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "WECHAT_WATCH_DIR": td},
+            )
+            self.assertTrue(os.path.isfile(recent), "20-min image crop must survive leftover")
+            self.assertTrue(os.path.isfile(recent_side), "sidecar json must stay")
+            self.assertFalse(os.path.isfile(old), "7-day-old image crop may expire")
+            self.assertTrue(os.path.isfile(old_side), "expired crop sidecar json must stay")
+
 
 def write_banded_thread(
     path: str,
@@ -1709,6 +1735,170 @@ class ListTextFingerprintTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(proc2.stdout.strip(), hexd)
+
+
+def write_image_and_text_png(
+    path: str,
+    w: int = 720,
+    h: int = 400,
+    box: tuple[int, int, int, int] = (80, 40, 200, 160),
+    color: str = "0x0A6E80",
+    text: str = "Hello",
+) -> None:
+    """White canvas + one large solid block + a separate text line (not the block)."""
+    write_box_png(path, w, h, box, color=color, bg="white")
+    ffmpeg = SYSTEM_FFMPEG if os.path.isfile(SYSTEM_FFMPEG) else "ffmpeg"
+    vf = (
+        f"drawtext=fontfile={CJK_FONT}:text='{text}':"
+        f"fontcolor=black:fontsize=48:x=80:y=260"
+    )
+    tmp = path + ".txt.png"
+    run_ffmpeg(
+        ffmpeg,
+        [
+            "-i",
+            path,
+            "-vf",
+            vf,
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            tmp,
+        ],
+    )
+    os.replace(tmp, path)
+
+
+class ImageCacheTests(unittest.TestCase):
+    """Read-only image-bubble detect + persist cache. No GUI, no send."""
+
+    def test_synthetic_block_cached_once_and_cli(self):
+        self.assertTrue(os.path.isfile(PERSIST_FFMPEG), "persist ffmpeg missing")
+        self.assertTrue(os.path.isfile(CJK_FONT), f"missing CJK font: {CJK_FONT}")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-img-") as td:
+            thread = os.path.join(td, "thread.png")
+            images_dir = os.path.join(td, "images")
+            write_image_and_text_png(thread)
+            recs = regions.cache_images(thread, images_dir, PERSIST_FFMPEG)
+            pngs = [
+                n for n in os.listdir(images_dir) if n.endswith(".png")
+            ]
+            self.assertEqual(len(recs), 1, recs)
+            self.assertEqual(len(pngs), 1, pngs)
+            crop = os.path.join(images_dir, pngs[0])
+            self.assertTrue(os.path.isfile(crop))
+            stem, _ext = os.path.splitext(pngs[0])
+            side = os.path.join(images_dir, stem + ".json")
+            self.assertTrue(os.path.isfile(side), "sidecar json missing")
+            with open(side, encoding="utf-8") as fh:
+                meta = json.loads(fh.read())
+            self.assertIn("hash", meta)
+            self.assertIn("box", meta)
+            self.assertIn("at", meta)
+            self.assertEqual(meta["hash"], stem)
+            box = meta["box"]
+            self.assertGreaterEqual(box["w"], 180)
+            self.assertGreaterEqual(box["h"], 140)
+            self.assertLess(box["w"], 400, "box must not be the whole canvas")
+            self.assertLess(box["h"], 300, "box must not be the whole canvas")
+            recs2 = regions.cache_images(thread, images_dir, PERSIST_FFMPEG)
+            pngs2 = [
+                n for n in os.listdir(images_dir) if n.endswith(".png")
+            ]
+            self.assertEqual(len(recs2), 1, recs2)
+            self.assertEqual(len(pngs2), 1, pngs2)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "--cache-images",
+                    thread,
+                    "--images-dir",
+                    images_dir,
+                    "--ffmpeg",
+                    PERSIST_FFMPEG,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("images=1", proc.stdout)
+            parsed = _parse_unread_stdout(proc.stdout)
+            img_path = parsed.get("image", "")
+            self.assertTrue(img_path, proc.stdout)
+            self.assertTrue(os.path.isfile(img_path), img_path)
+            pngs3 = [
+                n for n in os.listdir(images_dir) if n.endswith(".png")
+            ]
+            self.assertEqual(len(pngs3), 1, pngs3)
+
+    def test_text_only_is_zero_images(self):
+        self.assertTrue(os.path.isfile(CJK_FONT), f"missing CJK font: {CJK_FONT}")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-img-txt-") as td:
+            png = os.path.join(td, "hello.png")
+            images_dir = os.path.join(td, "images")
+            write_text_png(png, KNOWN_EN)
+            recs = regions.cache_images(png, images_dir, PERSIST_FFMPEG)
+            self.assertEqual(recs, [])
+            if os.path.isdir(images_dir):
+                pngs = [n for n in os.listdir(images_dir) if n.endswith(".png")]
+                self.assertEqual(pngs, [])
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "--cache-images",
+                    png,
+                    "--images-dir",
+                    images_dir,
+                    "--ffmpeg",
+                    PERSIST_FFMPEG,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("images=0", proc.stdout)
+
+    def test_docs_mention_cache_images_local_only(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+            readme = fh.read()
+        self.assertIn("--cache-images", readme)
+        self.assertIn("--detect-unread", readme)
+        self.assertIn("--detect-nav", readme)
+        folded = readme.lower()
+        self.assertTrue(
+            "不会上传" in readme or "never uploaded" in folded,
+            "README must say images are never uploaded",
+        )
+        self.assertTrue(
+            "不会发送" in readme or "never sent" in folded,
+            "README must say images are never sent",
+        )
+        self.assertTrue(
+            "本地" in readme or "local" in folded,
+            "README must say images stay local",
+        )
+
+    def test_cli_missing_png_exits_2(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                SCRIPT,
+                "--cache-images",
+                "/no/such/thread.png",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("ERROR", proc.stderr)
+
+    def test_diff_does_not_call_cache_images(self):
+        with open(os.path.join(ROOT, "wechat-watch-diff"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertNotIn("--cache-images", src)
 
 
 if __name__ == "__main__":

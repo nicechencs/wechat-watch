@@ -12,6 +12,8 @@
 #     JSON exists (already parsed); otherwise keep at most the last clip
 #     for 10 minutes
 #   - avatar png/jpg under avatars/ or identities/: delete if older than 7 days
+#   - images/*.png (hash-named image-bubble crops): 7-day expire like avatars;
+#     leftover 15-min sweep never deletes */images/*; sidecar json is kept
 set -euo pipefail
 
 WATCH="${WECHAT_WATCH_DIR:-/home/box/.local/share/wechat-persist/watch}"
@@ -145,6 +147,14 @@ for d in "$WATCH/avatars" "$WATCH/identities"; do
       done
 done
 
+# --- cached image bubbles: 7 days like avatars; sidecar json stays ---
+if [ -d "$WATCH/images" ]; then
+  find "$WATCH/images" \( -name '*.png' -o -name '*.jpg' \) -type f -print0 2>/dev/null \
+    | while IFS= read -r -d '' f; do
+        delete_if_old "$f" 10080
+      done
+fi
+
 # --- full.png: keep only the newest full*.png ---
 FULL_LIST="$(mktemp)"
 find "$WATCH" -maxdepth 1 \( -name 'full.png' -o -name 'full-*.png' -o -name 'full_*.png' \) \
@@ -172,7 +182,7 @@ find "$WATCH" \( -name '*.png' -o -name '*.jpg' \) -type f -print0 2>/dev/null \
           ;;
       esac
       case "$f" in
-        */regions/*|*/thread-regions/*|*/avatars/*|*/identities/*|*/clips/*|*/frames/*)
+        */regions/*|*/thread-regions/*|*/avatars/*|*/identities/*|*/clips/*|*/frames/*|*/images/*)
           continue
           ;;
       esac

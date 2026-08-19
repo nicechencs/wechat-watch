@@ -23,6 +23,8 @@ Usage:
   wechat-watch-regions --ocr-still THREAD.png [--json OUT.json] [--when ISO8601]
   wechat-watch-regions --detect-unread LIST.png   # red badge / dot / [N条] (read-only)
   wechat-watch-regions --detect-nav NAV.png       # left-nav icon badges (read-only)
+  wechat-watch-regions --cache-images THREAD.png [--images-dir DIR]
+      # read-only image-bubble crops; local persist only, never sent
   wechat-watch-regions --window-geom [--window-png WIN.png]
       # win/nav/list/thread + source= + id=; PNG scans gutters inside the window
   wechat-watch-regions --fingerprint TEXT
@@ -145,6 +147,14 @@ TIAO_RE = re.compile(r"\[(\d+)\s*条\]")
 Z_MARK_RE = re.compile(r"(?<![A-Za-z0-9])([zZ])(?![A-Za-z0-9])")
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 LIST_TEXT_FP_CHARS = 200
+
+# Image-bubble persist (read-only). Avatars ~40px; bubbles are larger.
+IMAGE_MIN_SIDE = 72
+IMAGE_MIN_AREA = 80 * 60
+IMAGE_MAX_FRAME_FRAC = 0.85
+IMAGE_PAD = 4
+IMAGE_MERGE_GAP = MERGE_GAP
+IMAGE_MAX_ASPECT = 8.0
 
 # CJK Unified Ideographs + common extensions / compatibility (not punctuation).
 _CJK_RANGES = (
@@ -2489,6 +2499,172 @@ def emit_nav_stdout(recs: list[dict]) -> None:
         print(f"nav{i}_h={int(rec.get('h') or 0)}")
 
 
+def default_persist() -> str:
+    return os.environ.get("WECHAT_PERSIST", "/home/box/.local/share/wechat-persist")
+
+
+def default_images_dir() -> str:
+    return os.path.join(default_persist(), "watch", "images")
+
+
+def _median_int(vals: list[int]) -> int:
+    if not vals:
+        return 245
+    vals.sort()
+    return vals[len(vals) // 2]
+
+
+def estimate_background_rgb(rgb: bytes, w: int, h: int) -> tuple[int, int, int]:
+    """Median RGB from corners + 1-px border (chat canvas, not the bubble)."""
+    if w <= 0 or h <= 0 or not rgb:
+        return (245, 245, 245)
+    rs: list[int] = []
+    gs: list[int] = []
+    bs: list[int] = []
+
+    def take(x: int, y: int) -> None:
+        i = (y * w + x) * 3
+        rs.append(rgb[i])
+        gs.append(rgb[i + 1])
+        bs.append(rgb[i + 2])
+
+    cw = min(6, w)
+    ch = min(6, h)
+    for y0 in (0, max(0, h - ch)):
+        for yy in range(y0, min(h, y0 + ch)):
+            for x0 in (0, max(0, w - cw)):
+                for xx in range(x0, min(w, x0 + cw)):
+                    take(xx, yy)
+    for x in range(w):
+        take(x, 0)
+        if h > 1:
+            take(x, h - 1)
+    for y in range(h):
+        take(0, y)
+        if w > 1:
+            take(w - 1, y)
+    return (_median_int(rs), _median_int(gs), _median_int(bs))
+
+
+def _image_at(when: datetime | str | None) -> str:
+    if when is None:
+        return datetime.now(timezone.utc).isoformat()
+    if isinstance(when, datetime):
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return when.isoformat()
+    return str(when)
+
+
+def detect_image_boxes(rgb: bytes, w: int, h: int) -> list[tuple[int, int, int, int]]:
+    """Large nearly-uniform or photo-like rectangles that are not the canvas.
+
+    Avatars (~40px), dots, and thin scrollbar strips are dropped. A large
+    solid-color block on a light chat background is kept. The full blank
+    frame is not.
+    """
+    if w <= 0 or h <= 0 or not rgb:
+        return []
+    br, bg, bb = estimate_background_rgb(rgb, w, h)
+    n = w * h
+    mask = bytearray(n)
+    for i in range(n):
+        o = i * 3
+        if (
+            abs(rgb[o] - br) > THRESH
+            or abs(rgb[o + 1] - bg) > THRESH
+            or abs(rgb[o + 2] - bb) > THRESH
+        ):
+            mask[i] = 1
+    kept = denoise(mask, w, h)
+    boxes = merge_boxes(components(kept, w, h), IMAGE_MERGE_GAP)
+    out: list[tuple[int, int, int, int]] = []
+    frame_area = float(w * h)
+    for box in boxes:
+        _x, _y, bw, bh = box
+        if bw < IMAGE_MIN_SIDE or bh < IMAGE_MIN_SIDE:
+            continue
+        if bw * bh < IMAGE_MIN_AREA:
+            continue
+        if frame_area and (bw * bh) > IMAGE_MAX_FRAME_FRAC * frame_area:
+            continue
+        if bw >= int(w * 0.92) and bh >= int(h * 0.92):
+            continue
+        shorter = min(bw, bh)
+        longer = max(bw, bh)
+        if shorter > 0 and longer / shorter > IMAGE_MAX_ASPECT:
+            continue
+        if bw <= SCROLLBAR_STRIP + 6 and _x >= w - SCROLLBAR_STRIP - 10:
+            continue
+        out.append(pad_box(box, w, h, IMAGE_PAD))
+    out.sort(key=lambda b: (b[1], b[0]))
+    return out
+
+
+def cache_images(
+    thread_png: str,
+    images_dir: str,
+    ffmpeg: str,
+    when: datetime | str | None = None,
+) -> list[dict]:
+    """Crop image-like bubbles from a thread PNG into images_dir (hash-named).
+
+    Idempotent: existing {hash}.png is reused, never written as a second file.
+    Sidecar {hash}.json is {hash, box, at}. Local persist only; never sent.
+    """
+    os.makedirs(images_dir, exist_ok=True)
+    at = _image_at(when)
+    w, h = png_size(thread_png)
+    recs: list[dict] = []
+    seen: set[str] = set()
+    with tempfile.TemporaryDirectory(prefix="wechat-watch-img-") as td:
+        rgb = decode_rgb24(ffmpeg, thread_png, w, h, os.path.join(td, "t.rgb"))
+        boxes = detect_image_boxes(rgb, w, h)
+        for i, box in enumerate(boxes):
+            crop = os.path.join(td, f"c{i}.png")
+            try:
+                crop_png(ffmpeg, thread_png, crop, box)
+            except (OSError, subprocess.CalledProcessError):
+                continue
+            _text, kind = ocr_png(crop, box)
+            if kind != "image":
+                continue
+            try:
+                with open(crop, "rb") as fh:
+                    digest = hashlib.sha256(fh.read()).hexdigest()
+            except OSError:
+                continue
+            if digest in seen:
+                continue
+            seen.add(digest)
+            dest = os.path.join(images_dir, f"{digest}.png")
+            side = os.path.join(images_dir, f"{digest}.json")
+            if not os.path.isfile(dest):
+                try:
+                    with open(crop, "rb") as src, open(dest, "wb") as dst:
+                        dst.write(src.read())
+                except OSError:
+                    continue
+            x, y, bw, bh = box
+            box_obj = {"x": int(x), "y": int(y), "w": int(bw), "h": int(bh)}
+            if not os.path.isfile(side):
+                meta = {"hash": digest, "box": box_obj, "at": at}
+                try:
+                    with open(side, "w", encoding="utf-8") as fh:
+                        json.dump(meta, fh, indent=2, ensure_ascii=False)
+                        fh.write("\n")
+                except OSError:
+                    pass
+            recs.append({"hash": digest, "path": dest, "box": box_obj, "at": at})
+    return recs
+
+
+def emit_images_stdout(recs: list[dict]) -> None:
+    print(f"images={len(recs)}")
+    for rec in recs:
+        print(f"image={rec.get('path', '')}")
+
+
 def default_ffmpeg() -> str:
     return os.environ.get(
         "WECHAT_FFMPEG",
@@ -2596,6 +2772,15 @@ def main() -> int:
         help="read-only: red badge / red dot on left-nav icons (by vertical slot)",
     )
     p.add_argument(
+        "--cache-images",
+        metavar="THREAD.png",
+        help="read-only: crop image-like bubbles into persist/watch/images (never sent)",
+    )
+    p.add_argument(
+        "--images-dir",
+        help="hashed image crops (default: $WECHAT_PERSIST/watch/images)",
+    )
+    p.add_argument(
         "--window-geom",
         action="store_true",
         help="print win/nav/list/thread as x,y,w,h and source= (env|tree|wm|desktop)",
@@ -2679,6 +2864,21 @@ def main() -> int:
         emit_nav_stdout(recs)
         return 0
 
+    if args.cache_images:
+        if not os.path.isfile(args.cache_images):
+            print(f"ERROR: thread png missing: {args.cache_images}", file=sys.stderr)
+            return 2
+        ffmpeg = resolve_ffmpeg(args.ffmpeg)
+        images_dir = args.images_dir or default_images_dir()
+        recs = cache_images(
+            args.cache_images,
+            images_dir,
+            ffmpeg,
+            when=parse_when(args.when),
+        )
+        emit_images_stdout(recs)
+        return 0
+
     if args.should_record:
         rec = should_record_scroll(bool(args.list_changed), bool(args.scrolling))
         print(f"record={1 if rec else 0}")
@@ -2743,7 +2943,7 @@ def main() -> int:
         return 0
 
     if not args.prev or not args.curr:
-        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread / --detect-nav / --window-geom / --fingerprint / --fingerprint-json")
+        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread / --detect-nav / --cache-images / --window-geom / --fingerprint / --fingerprint-json")
     if not args.out_dir or not args.json:
         p.error("--out-dir and --json are required unless --detect-scroll / --parse-frames / --should-record")
 
