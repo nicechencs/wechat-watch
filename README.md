@@ -309,7 +309,7 @@ wechat-watch/
 ├── wechat-watch.py         薄入口：`python3 wechat-watch.py send --peer … --text …`
 ├── wechat-watch-diff       Bash 入口：列表哈希、滚动才录像、GC
 ├── wechat-watch-regions    Python：差分切框 + OCR + 滚动检测 + 时间线 + 双时区 + 未读标记 + 1:1 --send
-├── wechat_watch_apply.py   --send 实况：已有窗口上的 AT-SPI 写文本（测试不走这里）
+├── wechat_watch_apply.py   --send 实况：已有窗口上 AT-SPI 填字并提交（测试不走这里）
 ├── wechat-watch-thread     只读：裁右侧对话区并 OCR，打印文本给 summaries
 ├── wechat-watch-gc         过期删除录像/截图，只留识别结果
 └── tests/test_regions.py   单元测试（含 1:1 send 拒群 / 拒空 / 匹配）

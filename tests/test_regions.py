@@ -2755,7 +2755,32 @@ class SendHelperTests(unittest.TestCase):
             self.assertFalse(rec["ok"])
             self.assertEqual(rec["error"], "group")
 
+    def test_apply_source_submits_after_fill(self):
+        path = os.path.join(ROOT, "wechat_watch_apply.py")
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("set_text_contents", src)
+        self.assertIn("print(\"OK\")", src)
+        has_return = "0xFF0D" in src or "Return" in src or "generate_keyboard_event" in src
+        has_send_btn = "发送" in src
+        self.assertTrue(has_return or has_send_btn, "apply must submit after fill")
+        fill_at = src.index("set_text_contents")
+        ok_at = src.index('print("OK")')
+        self.assertLess(fill_at, ok_at)
+        submit_at = min(
+            i
+            for i in (
+                src.find("generate_keyboard_event"),
+                src.find("0xFF0D"),
+                src.find("发送"),
+            )
+            if i >= 0
+        )
+        self.assertLess(fill_at, submit_at)
+        self.assertLess(submit_at, ok_at)
+
     def test_missing_args_mentions_send(self):
+
         proc = self._cli([])
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("--send", proc.stderr)
