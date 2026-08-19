@@ -21,6 +21,7 @@ THREAD_PREV="$STATE_DIR/thread.prev.png"
 WINDOW_PNG="$STATE_DIR/window.png"
 WINDOW_SHA="$STATE_DIR/window.sha256"
 WINDOW_BOXES="$STATE_DIR/window.boxes"
+LIST_TEXT_SHA="$STATE_DIR/list.text.sha"
 IDENTITIES="$STATE_DIR/identities.json"
 AVATARS_DIR="$STATE_DIR/avatars"
 CLIPS_DIR="$STATE_DIR/clips"
@@ -128,32 +129,91 @@ EOF
   fi
 }
 
-"$FFMPEG" -hide_banner -loglevel error -y \
-  -f x11grab -draw_mouse 0 -video_size 1280x800 -i "${DISPLAY_NUM}.0" \
-  -frames:v 1 -update 1 "$FULL"
+# --window-geom prints desktop coords. After a window-local grab, shift to frame origin.
+frame_local_crops() {
+  local wx="$1"
+  local wy="$2"
+  CROP_X=$((CROP_X - wx))
+  CROP_Y=$((CROP_Y - wy))
+  THREAD_X=$((THREAD_X - wx))
+  THREAD_Y=$((THREAD_Y - wy))
+  if [ "$CROP_X" -lt 0 ]; then CROP_X=0; fi
+  if [ "$CROP_Y" -lt 0 ]; then CROP_Y=0; fi
+  if [ "$THREAD_X" -lt 0 ]; then THREAD_X=0; fi
+  if [ "$THREAD_Y" -lt 0 ]; then THREAD_Y=0; fi
+}
 
-# win= only (no PNG): crop window.png from this same full grab.
 WIN_XYWH=""
+WIN_ID=""
 if [ -n "${REGIONS_PY}" ] && command -v python3 >/dev/null 2>&1; then
   _geom="$(python3 "$REGIONS_PY" --window-geom 2>/dev/null || true)"
   _win="$(printf '%s\n' "$_geom" | awk -F= '/^win=/{print $2; exit}')"
+  _id="$(printf '%s\n' "$_geom" | awk -F= '/^id=/{print $2; exit}')"
   if printf '%s' "${_win:-}" | grep -Eq '^-?[0-9]+,-?[0-9]+,[1-9][0-9]*,[1-9][0-9]*$'; then
     WIN_XYWH="$_win"
   fi
-  unset _geom _win
+  if printf '%s' "${_id:-}" | grep -Eq '^0x[0-9a-fA-F]+$'; then
+    WIN_ID="$_id"
+  fi
+  unset _geom _win _id
 fi
 
+WIN_X=0
+WIN_Y=0
+WIN_W=1280
+WIN_H=800
 if [ -n "$WIN_XYWH" ]; then
-  IFS=',' read -r _wx _wy _ww _wh <<EOF
+  IFS=',' read -r WIN_X WIN_Y WIN_W WIN_H <<EOF
 $WIN_XYWH
 EOF
-  if [ "$_wx" = "0" ] && [ "$_wy" = "0" ] && [ "$_ww" = "1280" ] && [ "$_wh" = "800" ]; then
+fi
+
+GRAB_IS_WINDOW=0
+_grabbed=0
+if [ -n "$WIN_ID" ] && [ "${WIN_W:-0}" -gt 0 ] && [ "${WIN_H:-0}" -gt 0 ]; then
+  if "$FFMPEG" -hide_banner -loglevel error -y \
+    -f x11grab -draw_mouse 0 \
+    -window_id "$WIN_ID" \
+    -video_size "${WIN_W}x${WIN_H}" \
+    -i "${DISPLAY_NUM}.0" \
+    -frames:v 1 -update 1 "$FULL"
+  then
+    _grabbed=1
+    GRAB_IS_WINDOW=1
+  fi
+fi
+if [ "$_grabbed" -eq 0 ] && [ -n "$WIN_XYWH" ]; then
+  if [ "$WIN_X" != "0" ] || [ "$WIN_Y" != "0" ] || [ "$WIN_W" != "1280" ] || [ "$WIN_H" != "800" ]; then
+    if [ "${WIN_W:-0}" -gt 0 ] && [ "${WIN_H:-0}" -gt 0 ]; then
+      if "$FFMPEG" -hide_banner -loglevel error -y \
+        -f x11grab -draw_mouse 0 \
+        -video_size "${WIN_W}x${WIN_H}" \
+        -i "${DISPLAY_NUM}.0+${WIN_X},${WIN_Y}" \
+        -frames:v 1 -update 1 "$FULL"
+      then
+        _grabbed=1
+        GRAB_IS_WINDOW=1
+      fi
+    fi
+  fi
+fi
+if [ "$_grabbed" -eq 0 ]; then
+  "$FFMPEG" -hide_banner -loglevel error -y \
+    -f x11grab -draw_mouse 0 -video_size 1280x800 -i "${DISPLAY_NUM}.0" \
+    -frames:v 1 -update 1 "$FULL"
+  GRAB_IS_WINDOW=0
+fi
+unset _grabbed
+
+if [ "$GRAB_IS_WINDOW" -eq 1 ] && [ -s "$FULL" ]; then
+  cp -f "$FULL" "$WINDOW_PNG" || true
+elif [ -n "$WIN_XYWH" ]; then
+  if [ "$WIN_X" = "0" ] && [ "$WIN_Y" = "0" ] && [ "$WIN_W" = "1280" ] && [ "$WIN_H" = "800" ]; then
     cp -f "$FULL" "$WINDOW_PNG" || true
   else
     "$FFMPEG" -hide_banner -loglevel error -y \
-      -i "$FULL" -filter:v "crop=${_ww}:${_wh}:${_wx}:${_wy}" "$WINDOW_PNG" || true
+      -i "$FULL" -filter:v "crop=${WIN_W}:${WIN_H}:${WIN_X}:${WIN_Y}" "$WINDOW_PNG" || true
   fi
-  unset _wx _wy _ww _wh
 fi
 
 # Reuse last list=/thread= when window.png hash and win= geom are unchanged.
@@ -187,6 +247,9 @@ if [ -n "$WIN_XYWH" ] && [ -s "$WINDOW_PNG" ] && [ -n "${REGIONS_PY}" ] && comma
     fi
   fi
   unset _win_hash _cache_hit _old_hash _old_win _list _thread _geom
+  if [ "$GRAB_IS_WINDOW" -eq 1 ]; then
+    frame_local_crops "$WIN_X" "$WIN_Y"
+  fi
 fi
 
 "$FFMPEG" -hide_banner -loglevel error -y \
@@ -351,17 +414,47 @@ if [ "$LIST_CHANGED" -eq 0 ]; then
   exit 0
 fi
 
+# Pixel hash flipped — OCR first, then decide real CHANGED vs list-text flap.
+OCR_OUT=""
+if [ "$HAD_PREV" -eq 0 ]; then
+  OCR_OUT="$(emit_full_list)"
+else
+  OCR_OUT="$(emit_list_diff)"
+fi
+
+FP=""
+if [ -n "${REGIONS_PY}" ] && command -v python3 >/dev/null 2>&1 && [ -f "$REGIONS_JSON" ]; then
+  FP="$(python3 "$REGIONS_PY" --fingerprint-json "$REGIONS_JSON" 2>/dev/null || true)"
+  FP="$(printf '%s' "$FP" | tr -d '[:space:]')"
+fi
+
+# Always store the new pixel hash so the next identical frame is cheap UNCHANGED.
 echo "$HASH" > "$PREV_HASH_FILE"
+
+if [ -n "$FP" ] && [ -f "$LIST_TEXT_SHA" ]; then
+  OLD_FP="$(tr -d '[:space:]' < "$LIST_TEXT_SHA")"
+  if [ -n "$OLD_FP" ] && [ "$FP" = "$OLD_FP" ]; then
+    printf '%s\n' "$FP" > "$LIST_TEXT_SHA"
+    echo "UNCHANGED"
+    echo "hash=$HASH"
+    echo "at=$NOW"
+    echo "flap=1"
+    maybe_record_scroll 0
+    run_gc
+    exit 0
+  fi
+fi
+
+if [ -n "$FP" ]; then
+  printf '%s\n' "$FP" > "$LIST_TEXT_SHA"
+fi
 echo "$NOW $HASH" >> "$STATE_DIR/changes.log"
 echo "CHANGED"
 echo "hash=$HASH"
 echo "at=$NOW"
 echo "list=$CROP"
-
-if [ "$HAD_PREV" -eq 0 ]; then
-  emit_full_list
-else
-  emit_list_diff
+if [ -n "$OCR_OUT" ]; then
+  printf '%s\n' "$OCR_OUT"
 fi
 
 # List change is the unread signal. It must not start video.

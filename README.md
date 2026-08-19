@@ -22,7 +22,7 @@
 ## 工作原理
 
 ```
-桌面 1280x800
+窗口优先，找不到才桌面 1280x800
     │  ffmpeg x11grab（关闭鼠标）
     ▼
 full.png
@@ -40,9 +40,9 @@ list.png ──sha256── list.sha256   thread.png（只用来判断滚没滚�
 
 会话列表的时间戳一般是「最后一条消息的时间」，不会每秒跳变，所以列表哈希在没新消息时是稳定的。输入框闪烁的光标在两块裁剪之外，不会误触发。
 
-裁剪跟找到的微信窗口走（`WECHAT_WINDOW=WxH+X+Y` 或 `X,Y,W,H`，或只读解析 `xwininfo -root -tree` / `wmctrl -lG`）；找不到再用上面的 1280×800 常量。
+裁剪跟找到的微信窗口走（`WECHAT_WINDOW=WxH+X+Y` 或 `X,Y,W,H`，或只读解析 `xwininfo -root -tree` / `wmctrl -lG`）；找不到再用上面的 1280×800 常量。实况优先按窗口 id 或窗口矩形抓帧，避免只抓桌面 1280×800 时裁不到移出/放大后的窗口。
 
-**窗口移动 / 缩放 / DPI（诚实说明）：** 窗口**移动**后，只要 `find_window` 拿到矩形（`WECHAT_WINDOW` / root-tree / `wmctrl -lG`），裁剪会跟着平移，这一步已经可用。窗口被拉窄、或用户拖了列表|对话区分隔线（**resize**）时，固定的 `NAV_INSET=1`、`LIST_INSET=63`、`THREAD_INSET=282` **不会**跟着分隔线走，窄窗或拖过的 list|thread 线会裁到错误的栏；`--window-geom --window-png` 会在窗口内部扫描竖向 gutter（分隔线）来跟栏。高度上若直接用整窗 `win_h`，会把标题栏、搜索框、输入框/发送都包进去（旧的最大化路径用的是 `+30/700` 和 `+40/660`）。150% / 200% 等分数缩放（DPI）**仍未处理**：像素 inset 会对不上，需要真实像素矩形再扫描，不能凭空缩放未知布局。实况 `wechat-watch-diff` / `wechat-watch-thread` 现在会写下 `watch/window.png` 并传给 `--window-png`，拖分隔线后裁剪会更新；150%/200% 分数 DPI 仍不会自动处理。
+**窗口移动 / 缩放 / DPI（诚实说明）：** 窗口**移动**后，只要 `find_window` 拿到矩形（`WECHAT_WINDOW` / root-tree / `wmctrl -lG`），裁剪会跟着平移，这一步已经可用。窗口被拉窄、或用户拖了列表|对话区分隔线（**resize**）时，固定的 `NAV_INSET=1`、`LIST_INSET=63`、`THREAD_INSET=282` **不会**跟着分隔线走，窄窗或拖过的 list|thread 线会裁到错误的栏；`--window-geom --window-png` 会在窗口内部扫描竖向 gutter（分隔线）来跟栏。高度上若直接用整窗 `win_h`，会把标题栏、搜索框、输入框/发送都包进去（旧的最大化路径用的是 `+30/700` 和 `+40/660`）。150% / 200% 等分数缩放（DPI）**仍未处理**：像素 inset 会对不上，需要真实像素矩形再扫描，不能凭空缩放未知布局。实况 `wechat-watch-diff` / `wechat-watch-thread` 现在会写下 `watch/window.png` 并传给 `--window-png`，拖分隔线后裁剪会更新；150%/200% 分数 DPI 仍不会自动处理。AT-SPI（python3-gi / Atspi）已能导入，但无障碍总线未运行、没有可用控件树，因此跳过实况 AT-SPI；不设置 QT_ACCESSIBILITY，也不重启应用。列表像素哈希若因光标/选区/徽章动画抖动，OCR 后的 text0 指纹（list.text.sha）相同则输出 UNCHANGED + flap=1，不当新内容。
 
 ## 翻历史、有滚动条才录屏
 
@@ -134,7 +134,7 @@ hash=715d94b8…
 at=2026-08-19T04:06:19+00:00
 ```
 
-此时不要读任何图片，也不要跑视觉模型。若正在翻历史，后面可能多出 `scroll=1` / `timeline=` 行。
+此时不要读任何图片，也不要跑视觉模型。若正在翻历史，后面可能多出 `scroll=1` / `timeline=` 行。若只有列表像素在抖、OCR text0 没变，也会走这条，并多一行 `flap=1`。
 
 ### 有变化（列表）
 
@@ -246,7 +246,7 @@ unread0_name=独立产品创业
 python3 tests/test_regions.py
 ```
 
-当前覆盖：假色块切框、徽章保留、大面积变化回退、中英 OCR、CLI 的 `textN=` / `kindN=`、thread 尺寸切框、左右气泡 → `in`/`out`、滚动检测、列表变化不录像、头像 average-hash、identities 绑定、时间线 JSON、`wechat-watch-gc` 过期删除、UTC/Asia/Shanghai 双时区、`wechat-watch-thread --png` 只读 OCR、左侧未读标记（红数字 / 红点 / `[N条]`）、窗口 gutter 扫描（移动 vs 缩放 / DPI）。
+当前覆盖：假色块切框、徽章保留、大面积变化回退、中英 OCR、CLI 的 `textN=` / `kindN=`、thread 尺寸切框、左右气泡 → `in`/`out`、滚动检测、列表变化不录像、头像 average-hash、identities 绑定、时间线 JSON、`wechat-watch-gc` 过期删除、UTC/Asia/Shanghai 双时区、`wechat-watch-thread --png` 只读 OCR、左侧未读标记（红数字 / 红点 / `[N条]`）、窗口 gutter 扫描（移动 vs 缩放 / DPI）、窗口 id 解析、列表 text0 指纹 / flap、注入式 AT-SPI 探测。
 
 ## 运行时文件（不进 git）
 
@@ -260,6 +260,7 @@ python3 tests/test_regions.py
 | `persist/watch/list.png` | 当前会话列表裁剪（**不删**，哈希依赖） |
 | `persist/watch/list.prev.png` | 上一帧列表（**不删**） |
 | `persist/watch/list.sha256` | 列表哈希（未读只看这个） |
+| `persist/watch/list.text.sha` | 列表 OCR text0 指纹（像素抖但文字没变 → flap=1） |
 | `persist/watch/thread.png` | 当前右侧对话区（**不删**，用来判断滚动） |
 | `persist/watch/thread.prev.png` | 上一帧对话区（**不删**） |
 | `persist/watch/regions.json` | 列表变化框 + OCR |
@@ -297,7 +298,7 @@ wechat-watch/
 - 对方头像 average-hash 后和昵称绑在 `identities.json`，下次同一头像即使 OCR 失败也能补上名字
 - **限制**：切会话会让整块 thread 换内容，但那是列表变化，不会录像。快速连滑时变化面积超过裁区 40%，会退回整块再 OCR，而不是逐条气泡
 
-1280×800 上实测：会话列表和对话区的竖线在 x=412，输入框/工具条从 y=742 开始。thread 裁剪为 `720x660+414+40`，下沿停在输入框之上，避免闪烁光标和 dock。窗口不在 0,0 时 `--window-geom` 会按找到的窗口算裁剪；找不到仍用这些常量。有窗口 PNG 时扫描 gutter；其它 DPI / 缩放仍未处理，不能靠常量放大。
+1280×800 上实测：会话列表和对话区的竖线在 x=412，输入框/工具条从 y=742 开始。thread 裁剪为 `720x660+414+40`，下沿停在输入框之上，避免闪烁光标和 dock。窗口不在 0,0 时 `--window-geom` 会按找到的窗口算裁剪，并尽量带上 id=0x…；找不到仍用这些常量。有窗口 PNG 时扫描 gutter；其它 DPI / 缩放仍未处理，不能靠常量放大。
 
 单独复用切框脚本时请加 `--prefix t --label thread_ --emit-side`，不要复制一份差分逻辑。
 

@@ -1327,6 +1327,9 @@ class WindowGeomTests(unittest.TestCase):
             readme = fh.read()
         self.assertIn("--window-geom", readme)
         self.assertIn("WECHAT_WINDOW", readme)
+        self.assertIn("AT-SPI", readme)
+        self.assertIn("flap=1", readme)
+        self.assertIn("list.text.sha", readme)
 
     def test_diff_and_thread_call_window_geom(self):
         with open(os.path.join(ROOT, "wechat-watch-diff"), encoding="utf-8") as fh:
@@ -1344,15 +1347,21 @@ class WindowGeomTests(unittest.TestCase):
         self.assertIn("--window-geom", thread)
         self.assertIn("THREAD_W=720", thread)
         self.assertIn("--window-png", thread)
-        # Cheap UNCHANGED path must exit before any OCR helper is invoked.
-        unchanged_only = diff.split('if [ "$LIST_CHANGED" -eq 0 ]', 1)[1].split(
-            'echo "CHANGED"', 1
-        )[0]
-        self.assertIn('echo "UNCHANGED"', unchanged_only)
-        self.assertIn("exit 0", unchanged_only)
-        self.assertNotIn("emit_list_diff", unchanged_only)
-        self.assertNotIn("emit_full_list", unchanged_only)
-        self.assertNotIn("ocr", unchanged_only.lower())
+        self.assertTrue(
+            "-window_id" in diff or "window_id" in diff,
+            "diff must prefer ffmpeg x11grab -window_id",
+        )
+        self.assertIn("1280x800", diff)
+        self.assertIn("list.text.sha", diff)
+        self.assertIn("flap=1", diff)
+        # Cheap pixel-hash UNCHANGED path must exit before any OCR helper.
+        cheap = diff.split('if [ "$LIST_CHANGED" -eq 0 ]', 1)[1]
+        cheap_branch = cheap.split("fi", 1)[0]
+        self.assertIn('echo "UNCHANGED"', cheap_branch)
+        self.assertIn("exit 0", cheap_branch)
+        self.assertNotIn("emit_list_diff", cheap_branch)
+        self.assertNotIn("emit_full_list", cheap_branch)
+        self.assertNotIn("ocr", cheap_branch.lower())
 
 
 def write_three_pane_png(
@@ -1563,6 +1572,143 @@ class PaneDetectTests(unittest.TestCase):
             tx = int(parsed["thread"].split(",")[0])
             self.assertLessEqual(abs(tx - 251), 16, parsed)
             self.assertNotEqual(tx, 282, parsed)
+
+
+class WindowIdTests(unittest.TestCase):
+    """Parse X11 window id from a fake tree. No live app."""
+
+    def test_parse_tree_window_id_fake_line(self):
+        wid = regions.parse_tree_window_id(FAKE_XWININFO_TREE)
+        self.assertEqual(wid.lower(), "0x200007")
+        self.assertIsNone(regions.parse_tree_window_id("no windows here"))
+        zh = '     0xabc "微信": ("wechat" "WeChat")  900x700+40+20  +40+20\n'
+        self.assertEqual(regions.parse_tree_window_id(zh).lower(), "0xabc")
+
+    def test_find_window_id_env_and_tree(self):
+        self.assertEqual(
+            regions.find_window_id(
+                env={"WECHAT_WINDOW_ID": "0xFEED"},
+                tree_text=FAKE_XWININFO_TREE,
+                probe=False,
+            ),
+            "0xFEED",
+        )
+        self.assertEqual(
+            regions.find_window_id(
+                env={},
+                tree_text=FAKE_XWININFO_TREE,
+                probe=False,
+            ),
+            "0x200007",
+        )
+        self.assertIsNone(
+            regions.find_window_id(env={}, tree_text="nothing", probe=False)
+        )
+
+    def test_window_crops_non_desktop_positive_boxes(self):
+        for geom in ((130, 6, 1019, 736), (10, 20, 800, 600), (0, 0, 900, 700)):
+            crops = regions.window_crops(*geom)
+            for key in ("list", "thread"):
+                x, y, w, h = crops[key]
+                self.assertGreater(w, 0, (geom, key, crops[key]))
+                self.assertGreater(h, 0, (geom, key, crops[key]))
+
+
+class AtspiProbeTests(unittest.TestCase):
+    """Injected tree/extents only. No live WeChat / Atspi bus."""
+
+    FAKE_TREE = (
+        "WeChat application 0 0 1019 736\n"
+        "list list 63 30 349 700\n"
+        "thread document 412 40 607 660\n"
+    )
+
+    def test_probe_atspi_fake_tree(self):
+        panes = regions.probe_atspi(tree=self.FAKE_TREE)
+        self.assertIsNotNone(panes)
+        self.assertEqual(panes["list"], (63, 30, 349, 700))
+        self.assertEqual(panes["thread"], (412, 40, 607, 660))
+
+    def test_probe_atspi_injected_extents(self):
+        extents = [
+            {"name": "session", "role": "list", "x": 70, "y": 32, "w": 340, "h": 680},
+            {"name": "chat", "role": "document", "x": 420, "y": 40, "w": 600, "h": 650},
+        ]
+        panes = regions.probe_atspi(extents=extents)
+        self.assertEqual(panes["list"][2], 340)
+        self.assertEqual(panes["thread"][0], 420)
+        self.assertGreater(panes["list"][2], 0)
+        self.assertGreater(panes["thread"][3], 0)
+
+    def test_probe_atspi_empty_or_unrelated(self):
+        self.assertIsNone(regions.probe_atspi(tree=""))
+        self.assertIsNone(regions.probe_atspi(tree="Clock application 0 0 120 40\n"))
+        self.assertIsNone(regions.probe_atspi(extents=[]))
+        self.assertIsNone(
+            regions.probe_atspi(
+                extents=[{"name": "clock", "role": "clock", "x": 0, "y": 0, "w": 40, "h": 40}]
+            )
+        )
+
+
+class ListTextFingerprintTests(unittest.TestCase):
+    """Normalize + fingerprint. No vision / tesseract."""
+
+    def test_normalize_collapses_whitespace(self):
+        a = regions.normalize_list_text("stone  撤回\n\nWeixin Pay")
+        b = regions.normalize_list_text("stone 撤回 Weixin Pay")
+        self.assertEqual(a, b)
+        self.assertEqual(a, "stone 撤回 Weixin Pay")
+
+    def test_fingerprint_same_text(self):
+        a = regions.list_text_fingerprint("stone  撤回\n\nWeixin Pay")
+        b = regions.list_text_fingerprint("stone 撤回 Weixin Pay")
+        self.assertEqual(a, b)
+        self.assertEqual(len(a), 64)
+        self.assertEqual(a, regions.list_text_fingerprint("stone 撤回 Weixin Pay"))
+
+    def test_fingerprint_different_text(self):
+        a = regions.list_text_fingerprint("stone 撤回")
+        b = regions.list_text_fingerprint("Weixin Pay")
+        self.assertNotEqual(a, b)
+
+    def test_fingerprint_first_200_chars(self):
+        long = ("阿" * 180) + ("坤" * 120)
+        self.assertEqual(
+            regions.list_text_fingerprint(long),
+            regions.list_text_fingerprint(long[:200]),
+        )
+        changed = long[:199] + "X" + long[200:]
+        self.assertNotEqual(
+            regions.list_text_fingerprint(long),
+            regions.list_text_fingerprint(changed),
+        )
+        tail = long[:200] + "YYYY"
+        self.assertEqual(
+            regions.list_text_fingerprint(long),
+            regions.list_text_fingerprint(tail),
+        )
+
+    def test_cli_fingerprint_and_json(self):
+        proc = subprocess.run(
+            [sys.executable, SCRIPT, "--fingerprint", "stone  撤回  Weixin Pay"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        hexd = proc.stdout.strip()
+        self.assertEqual(hexd, regions.list_text_fingerprint("stone 撤回 Weixin Pay"))
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-fp-") as td:
+            path = os.path.join(td, "regions.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump([{"text": "stone  撤回\nWeixin Pay", "kind": "text"}], fh)
+            proc2 = subprocess.run(
+                [sys.executable, SCRIPT, "--fingerprint-json", path],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc2.stdout.strip(), hexd)
 
 
 if __name__ == "__main__":

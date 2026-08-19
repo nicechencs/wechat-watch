@@ -168,29 +168,74 @@ case "$MODE" in
     # Live grab only: follow the found window. --png/--still keep constants
     # so a pre-cropped 720x660 still matches. Fail → 720x660+414+40.
     FULL="$STATE_DIR/thread-read-full.png"
-    "$FFMPEG" -hide_banner -loglevel error -y \
-      -f x11grab -draw_mouse 0 -video_size "${FULL_W}x${FULL_H}" -i "${DISPLAY_NUM}.0" \
-      -frames:v 1 -update 1 "$FULL"
     WIN_XYWH=""
+    WIN_ID=""
     if [ -n "${REGIONS_PY}" ] && command -v python3 >/dev/null 2>&1; then
       _geom="$(python3 "$REGIONS_PY" --window-geom 2>/dev/null || true)"
       _win="$(printf '%s\n' "$_geom" | awk -F= '/^win=/{print $2; exit}')"
+      _id="$(printf '%s\n' "$_geom" | awk -F= '/^id=/{print $2; exit}')"
       if printf '%s' "${_win:-}" | grep -Eq '^-?[0-9]+,-?[0-9]+,[1-9][0-9]*,[1-9][0-9]*$'; then
         WIN_XYWH="$_win"
       fi
-      unset _geom _win
+      if printf '%s' "${_id:-}" | grep -Eq '^0x[0-9a-fA-F]+$'; then
+        WIN_ID="$_id"
+      fi
+      unset _geom _win _id
     fi
+    WIN_X=0
+    WIN_Y=0
+    WIN_W="$FULL_W"
+    WIN_H="$FULL_H"
     if [ -n "$WIN_XYWH" ]; then
-      IFS=',' read -r _wx _wy _ww _wh <<EOF
+      IFS=',' read -r WIN_X WIN_Y WIN_W WIN_H <<EOF
 $WIN_XYWH
 EOF
-      if [ "$_wx" = "0" ] && [ "$_wy" = "0" ] && [ "$_ww" = "1280" ] && [ "$_wh" = "800" ]; then
+    fi
+    GRAB_IS_WINDOW=0
+    _grabbed=0
+    if [ -n "$WIN_ID" ] && [ "${WIN_W:-0}" -gt 0 ] && [ "${WIN_H:-0}" -gt 0 ]; then
+      if "$FFMPEG" -hide_banner -loglevel error -y \
+        -f x11grab -draw_mouse 0 \
+        -window_id "$WIN_ID" \
+        -video_size "${WIN_W}x${WIN_H}" \
+        -i "${DISPLAY_NUM}.0" \
+        -frames:v 1 -update 1 "$FULL"
+      then
+        _grabbed=1
+        GRAB_IS_WINDOW=1
+      fi
+    fi
+    if [ "$_grabbed" -eq 0 ] && [ -n "$WIN_XYWH" ]; then
+      if [ "$WIN_X" != "0" ] || [ "$WIN_Y" != "0" ] || [ "$WIN_W" != "$FULL_W" ] || [ "$WIN_H" != "$FULL_H" ]; then
+        if [ "${WIN_W:-0}" -gt 0 ] && [ "${WIN_H:-0}" -gt 0 ]; then
+          if "$FFMPEG" -hide_banner -loglevel error -y \
+            -f x11grab -draw_mouse 0 \
+            -video_size "${WIN_W}x${WIN_H}" \
+            -i "${DISPLAY_NUM}.0+${WIN_X},${WIN_Y}" \
+            -frames:v 1 -update 1 "$FULL"
+          then
+            _grabbed=1
+            GRAB_IS_WINDOW=1
+          fi
+        fi
+      fi
+    fi
+    if [ "$_grabbed" -eq 0 ]; then
+      "$FFMPEG" -hide_banner -loglevel error -y \
+        -f x11grab -draw_mouse 0 -video_size "${FULL_W}x${FULL_H}" -i "${DISPLAY_NUM}.0" \
+        -frames:v 1 -update 1 "$FULL"
+      GRAB_IS_WINDOW=0
+    fi
+    unset _grabbed
+    if [ "$GRAB_IS_WINDOW" -eq 1 ] && [ -s "$FULL" ]; then
+      cp -f "$FULL" "$WINDOW_PNG" || true
+    elif [ -n "$WIN_XYWH" ]; then
+      if [ "$WIN_X" = "0" ] && [ "$WIN_Y" = "0" ] && [ "$WIN_W" = "1280" ] && [ "$WIN_H" = "800" ]; then
         cp -f "$FULL" "$WINDOW_PNG" || true
       else
         "$FFMPEG" -hide_banner -loglevel error -y \
-          -i "$FULL" -filter:v "crop=${_ww}:${_wh}:${_wx}:${_wy}" "$WINDOW_PNG" || true
+          -i "$FULL" -filter:v "crop=${WIN_W}:${WIN_H}:${WIN_X}:${WIN_Y}" "$WINDOW_PNG" || true
       fi
-      unset _wx _wy _ww _wh
     fi
     if [ -n "$WIN_XYWH" ] && [ -s "$WINDOW_PNG" ] && [ -n "${REGIONS_PY}" ] && command -v python3 >/dev/null 2>&1; then
       _win_hash="$(sha256sum "$WINDOW_PNG" | awk '{print $1}')"
@@ -229,6 +274,12 @@ EOF
         fi
       fi
       unset _win_hash _cache_hit _old_hash _old_win _list _thread _geom
+      if [ "$GRAB_IS_WINDOW" -eq 1 ]; then
+        THREAD_X=$((THREAD_X - WIN_X))
+        THREAD_Y=$((THREAD_Y - WIN_Y))
+        if [ "$THREAD_X" -lt 0 ]; then THREAD_X=0; fi
+        if [ "$THREAD_Y" -lt 0 ]; then THREAD_Y=0; fi
+      fi
     fi
     ensure_thread_crop "$FULL" "$THREAD_READ"
     rm -f "$FULL"

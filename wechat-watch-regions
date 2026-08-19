@@ -24,11 +24,14 @@ Usage:
   wechat-watch-regions --detect-unread LIST.png   # red badge / dot / [N条] (read-only)
   wechat-watch-regions --detect-nav NAV.png       # left-nav icon badges (read-only)
   wechat-watch-regions --window-geom [--window-png WIN.png]
-      # win/nav/list/thread + source=; PNG scans gutters inside the window
+      # win/nav/list/thread + source= + id=; PNG scans gutters inside the window
+  wechat-watch-regions --fingerprint TEXT
+  wechat-watch-regions --fingerprint-json regions.json
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -141,6 +144,7 @@ UNREAD_BADGE_PAD = 3
 TIAO_RE = re.compile(r"\[(\d+)\s*条\]")
 Z_MARK_RE = re.compile(r"(?<![A-Za-z0-9])([zZ])(?![A-Za-z0-9])")
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+LIST_TEXT_FP_CHARS = 200
 
 # CJK Unified Ideographs + common extensions / compatibility (not punctuation).
 _CJK_RANGES = (
@@ -2041,6 +2045,268 @@ def parse_root_tree(text: str, app: str = APP_NAME) -> tuple[int, int, int, int]
     return best
 
 
+def parse_tree_window_id(text: str, app: str = APP_NAME) -> str | None:
+    """Largest matching title/class line → X11 window id (0x…)."""
+    best_id: str | None = None
+    best_area = -1
+    for line in (text or "").splitlines():
+        id_m = _WIN_ID_RE.search(line)
+        if not id_m:
+            continue
+        box = _geom_from_tree_line(line)
+        if box is None:
+            continue
+        title, wm_class = _title_class_from_tree_line(line)
+        if not window_matches(title, wm_class, app):
+            continue
+        area = box[2] * box[3]
+        if area > best_area:
+            best_area = area
+            best_id = id_m.group(0)
+    return best_id
+
+
+def find_window_id(
+    env: dict[str, str] | None = None,
+    tree_text: str | None = None,
+    app: str = APP_NAME,
+    probe: bool = True,
+) -> str | None:
+    """X11 id for the WeChat window. Read-only; never drives the GUI."""
+    environ = os.environ if env is None else env
+    spec = (environ.get("WECHAT_WINDOW_ID") or "").strip()
+    if spec and _WIN_ID_RE.fullmatch(spec):
+        return spec
+    tree = tree_text
+    if tree is None and probe:
+        tree = _dump_cmd(["xwininfo", "-root", "-tree"])
+    if tree:
+        parsed = parse_tree_window_id(tree, app=app)
+        if parsed:
+            return parsed
+    return None
+
+
+def normalize_list_text(s: str) -> str:
+    """Collapse whitespace so cursor/selection noise in OCR does not flap."""
+    return " ".join((s or "").split())
+
+
+def list_text_fingerprint(s: str) -> str:
+    """sha256 hex of normalize_list_text(s)[:200]."""
+    norm = normalize_list_text(s)[:LIST_TEXT_FP_CHARS]
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+
+def list_text_from_records(recs: list) -> str:
+    if not recs:
+        return ""
+    first = recs[0]
+    if isinstance(first, dict):
+        return str(first.get("text") or "")
+    return ""
+
+
+def list_text_from_json(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            recs = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(recs, list):
+        return ""
+    return list_text_from_records(recs)
+
+
+_ATSPI_TREE_LINE = re.compile(
+    r"^(\S+)\s+(\S+)\s+(-?\d+)\s+(-?\d+)\s+(\d+)\s+(\d+)\s*$"
+)
+_ATSPI_LIST_KEYS = ("list", "session", "会话")
+_ATSPI_THREAD_KEYS = (
+    "thread",
+    "message",
+    "conversation",
+    "document",
+    "page",
+    "对话",
+)
+
+
+def _parse_atspi_tree(text: str) -> list[dict]:
+    recs: list[dict] = []
+    for line in (text or "").splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#"):
+            continue
+        m = _ATSPI_TREE_LINE.match(raw)
+        if not m:
+            continue
+        recs.append(
+            {
+                "name": m.group(1),
+                "role": m.group(2),
+                "x": int(m.group(3)),
+                "y": int(m.group(4)),
+                "w": int(m.group(5)),
+                "h": int(m.group(6)),
+            }
+        )
+    return recs
+
+
+def _panes_from_extent_recs(recs: list[dict]) -> dict | None:
+    """list/thread boxes from injected or live extents. None if not useful."""
+    useful: list[dict] = []
+    for r in recs:
+        if not isinstance(r, dict):
+            continue
+        try:
+            x, y = int(r["x"]), int(r["y"])
+            w, h = int(r["w"]), int(r["h"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if w < 80 or h < 80:
+            continue
+        useful.append(
+            {
+                "name": str(r.get("name") or ""),
+                "role": str(r.get("role") or ""),
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+            }
+        )
+    if not useful:
+        return None
+    list_box = None
+    thread_box = None
+    for r in useful:
+        blob = f"{r['name']} {r['role']}".lower()
+        box = (r["x"], r["y"], r["w"], r["h"])
+        if any(k in blob for k in _ATSPI_LIST_KEYS):
+            list_box = box
+        elif any(k in blob for k in _ATSPI_THREAD_KEYS):
+            thread_box = box
+    if list_box and thread_box:
+        return {"list": list_box, "thread": thread_box}
+    return None
+
+
+def _atspi_bus_present() -> bool:
+    try:
+        proc = subprocess.run(
+            [
+                "dbus-send",
+                "--session",
+                "--print-reply",
+                "--dest=org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus.NameHasOwner",
+                "string:org.a11y.Bus",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "boolean true" in (proc.stdout or "").lower()
+
+
+def _probe_atspi_live_recs() -> list[dict]:
+    """Best-effort live dump in a child so an Atspi abort cannot kill us."""
+    if not _atspi_bus_present():
+        return []
+    code = (
+        "import os,sys\n"
+        "os.environ.setdefault('DISPLAY', os.environ.get('DISPLAY', ':8'))\n"
+        "try:\n"
+        " import gi\n"
+        " gi.require_version('Atspi','2.0')\n"
+        " from gi.repository import Atspi\n"
+        " desk=Atspi.get_desktop(0)\n"
+        "except Exception:\n"
+        " sys.exit(0)\n"
+        "n=0\n"
+        "try:\n"
+        " n=desk.get_child_count()\n"
+        "except Exception:\n"
+        " sys.exit(0)\n"
+        "for i in range(n):\n"
+        " try:\n"
+        "  app=desk.get_child_at_index(i)\n"
+        " except Exception:\n"
+        "  continue\n"
+        " if app is None: continue\n"
+        " name=role=''\n"
+        " try: name=app.get_name() or ''\n"
+        " except Exception: pass\n"
+        " try: role=app.get_role_name() or ''\n"
+        " except Exception: pass\n"
+        " blob=(name+' '+role).lower()\n"
+        " if 'wechat-watch' in blob: continue\n"
+        " if not any(k in blob for k in ('wechat','weixin','微信')): continue\n"
+        " cc=0\n"
+        " try: cc=app.get_child_count()\n"
+        " except Exception: cc=0\n"
+        " for j in range(min(cc, 40)):\n"
+        "  try: ch=app.get_child_at_index(j)\n"
+        "  except Exception: continue\n"
+        "  if ch is None: continue\n"
+        "  cn=cr=''\n"
+        "  try: cn=ch.get_name() or ''\n"
+        "  except Exception: pass\n"
+        "  try: cr=ch.get_role_name() or ''\n"
+        "  except Exception: pass\n"
+        "  try:\n"
+        "   e=ch.get_extents(Atspi.CoordType.SCREEN)\n"
+        "   print(f'{(cn or \"child\").replace(\" \",\"_\")} {(cr or \"unknown\").replace(\" \",\"_\")} {int(e.x)} {int(e.y)} {int(e.width)} {int(e.height)}')\n"
+        "  except Exception:\n"
+        "   continue\n"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=4,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    return _parse_atspi_tree(proc.stdout or "")
+
+
+def probe_atspi(
+    tree: str | None = None,
+    extents: list | None = None,
+) -> dict | None:
+    """Optional AT-SPI pane boxes. None if the tree is empty or not useful.
+
+    Tests inject a fake tree string or extents (no live bus). Live Atspi is
+    read-only and returns None when gi/bus/WeChat/useful children are missing.
+    Never raises. Never sets QT_ACCESSIBILITY. Boxes are extents as given
+    (typically screen/desktop coords): {"list": (x,y,w,h), "thread": (x,y,w,h)}.
+    """
+    try:
+        recs: list[dict] = []
+        if extents is not None:
+            recs.extend(list(extents))
+        if tree is not None:
+            recs.extend(_parse_atspi_tree(tree))
+        if tree is None and extents is None:
+            recs.extend(_probe_atspi_live_recs())
+        if not recs:
+            return None
+        return _panes_from_extent_recs(recs)
+    except Exception:
+        return None
+
+
 def parse_wm_geometry(text: str, app: str = APP_NAME) -> tuple[int, int, int, int] | None:
     """Parse `wmctrl -lG` (list-geometry) dump text. Largest matching title."""
     best: tuple[int, int, int, int] | None = None
@@ -2140,6 +2406,8 @@ def emit_window_geom(
     print(f"list={fmt_xywh(crops['list'])}")
     print(f"thread={fmt_xywh(crops['thread'])}")
     print(f"source={source}")
+    wid = find_window_id()
+    print(f"id={wid or ''}")
 
 
 def _nav_icon_box(y_frac: float, w: int, h: int) -> tuple[int, int, int, int]:
@@ -2337,7 +2605,25 @@ def main() -> int:
         metavar="WIN.png",
         help="optional window-local PNG; scan gutters and pass rgb into window_crops",
     )
+    p.add_argument(
+        "--fingerprint",
+        metavar="TEXT",
+        help="print sha256 of normalized list text (first 200 chars)",
+    )
+    p.add_argument(
+        "--fingerprint-json",
+        metavar="regions.json",
+        help="print list-text fingerprint of text0 / first record",
+    )
     args = p.parse_args()
+
+    if args.fingerprint is not None:
+        print(list_text_fingerprint(args.fingerprint))
+        return 0
+
+    if args.fingerprint_json:
+        print(list_text_fingerprint(list_text_from_json(args.fingerprint_json)))
+        return 0
 
     if args.window_geom:
         win, source = find_window()
@@ -2457,7 +2743,7 @@ def main() -> int:
         return 0
 
     if not args.prev or not args.curr:
-        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread / --detect-nav / --window-geom")
+        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread / --detect-nav / --window-geom / --fingerprint / --fingerprint-json")
     if not args.out_dir or not args.json:
         p.error("--out-dir and --json are required unless --detect-scroll / --parse-frames / --should-record")
 
