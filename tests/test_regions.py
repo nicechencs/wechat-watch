@@ -2546,5 +2546,222 @@ class NickRobustTests(unittest.TestCase):
         self.assertNotIn("normalize_nick", src)
 
 
+class SendHelperTests(unittest.TestCase):
+    """1:1 --send: refuse groups/empty, match existing peers. Never live-types."""
+
+    def _cli(self, argv):
+        return subprocess.run(
+            [sys.executable, SCRIPT, *argv],
+            capture_output=True,
+            text=True,
+        )
+
+    def _last_json(self, stdout: str) -> dict:
+        lines = [ln for ln in (stdout or "").splitlines() if ln.strip()]
+        self.assertTrue(lines, stdout)
+        return json.loads(lines[-1])
+
+    def test_refuse_group_names(self):
+        names = (
+            "独立产品创业联盟3群",
+            "foo@chatroom",
+            "collage group",
+            "Collage Group",
+            "产品群",
+        )
+        for name in names:
+            self.assertTrue(regions.looks_like_group(name), name)
+            with self.assertRaises(regions.SendRefused) as ctx:
+                regions.validate_send(name, "好")
+            self.assertEqual(ctx.exception.error, "group", name)
+            plan_err = None
+            try:
+                regions.plan_private_send(peer=name, text="好", sessions=[{"name": name}])
+            except regions.SendRefused as exc:
+                plan_err = exc.error
+            self.assertEqual(plan_err, "group", name)
+
+    def test_refuse_empty_text(self):
+        for text in ("", "   ", None):
+            with self.assertRaises(regions.SendRefused) as ctx:
+                regions.validate_send("阿坤", text)
+            self.assertEqual(ctx.exception.error, "empty-text")
+
+    def test_peer_matching_exact_prefix_username(self):
+        sessions = [
+            {"name": "阿坤", "username": "wxid_akun"},
+            {"name": "独立产品创业联盟3群"},
+            {"name": "文件传输助手"},
+            {"name": "Weixin Team"},
+            {"name": "阿坤的群"},
+        ]
+        hit = regions.match_peer("阿坤", sessions)
+        self.assertEqual(hit["name"], "阿坤")
+        hit = regions.match_peer("  阿坤  ", sessions)
+        self.assertEqual(hit["name"], "阿坤")
+        hit = regions.match_peer("nobody", sessions, username="wxid_akun")
+        self.assertEqual(hit["name"], "阿坤")
+        with self.assertRaises(regions.SendRefused) as ctx:
+            regions.match_peer("独立产品创业联盟3群", sessions)
+        self.assertEqual(ctx.exception.error, "group")
+        with self.assertRaises(regions.SendRefused) as ctx:
+            regions.match_peer("文件传输助手", sessions)
+        self.assertEqual(ctx.exception.error, "skipped-peer")
+        with self.assertRaises(regions.SendRefused) as ctx:
+            regions.match_peer("Weixin Team", sessions)
+        self.assertEqual(ctx.exception.error, "skipped-peer")
+        with self.assertRaises(regions.SendRefused) as ctx:
+            regions.match_peer("ghost", sessions)
+        self.assertEqual(ctx.exception.error, "peer-not-found")
+        # group/skipped rows are not valid prefix hits
+        hit = regions.match_peer("阿", sessions)
+        self.assertEqual(hit["name"], "阿坤")
+
+    def test_peer_ambiguous_and_skipped_units(self):
+        sessions = [{"name": "阿坤"}, {"name": "阿强"}]
+        with self.assertRaises(regions.SendRefused) as ctx:
+            regions.match_peer("阿", sessions)
+        self.assertEqual(ctx.exception.error, "ambiguous-peer")
+        for name in ("文件传输助手", "File Transfer", "Weixin Team", "微信团队"):
+            self.assertTrue(regions.is_skipped_peer(name), name)
+            with self.assertRaises(regions.SendRefused) as ctx:
+                regions.validate_send(name, "好")
+            self.assertEqual(ctx.exception.error, "skipped-peer", name)
+        self.assertFalse(regions.looks_like_group("阿坤"))
+        self.assertFalse(regions.is_skipped_peer("阿坤"))
+
+    def test_plan_existing_session_only(self):
+        plan = regions.plan_private_send(
+            peer="阿坤",
+            text="好",
+            sessions=[{"name": "阿坤", "row": 1}, {"name": "产品群"}],
+            win=(0, 0, 1280, 800),
+        )
+        ops = [a["op"] for a in plan["actions"]]
+        self.assertEqual(ops[0], "focus-session")
+        self.assertIn("focus-input", ops)
+        self.assertIn("type", ops)
+        self.assertIn("submit", ops)
+        self.assertNotIn("search", ops)
+        self.assertNotIn("add-contact", ops)
+        self.assertNotIn("new-chat", ops)
+        self.assertEqual(plan["peer"], "阿坤")
+        self.assertEqual(plan["text"], "好")
+        self.assertEqual(plan["session"]["name"], "阿坤")
+        crops = regions.window_crops(0, 0, 1280, 800)
+        _tx, ty, _tw, th = crops["thread"]
+        _ix, iy = plan["input"]
+        self.assertGreaterEqual(iy, ty + th - 20)
+        self.assertLess(iy, 800)
+
+    def test_dry_driver_executes_plan_without_desktop(self):
+        drv = regions.DrySendDriver()
+        result = regions.run_send(
+            "阿坤",
+            "好",
+            sessions=[{"name": "阿坤", "row": 1}],
+            dry_run=False,
+            driver=drv,
+            probe_window=False,
+            env={"WECHAT_WINDOW": "1019x736+10+20"},
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["peer"], "阿坤")
+        self.assertEqual(result["text"], "好")
+        ops = [c["op"] for c in drv.calls]
+        self.assertIn("focus", ops)
+        self.assertIn("type", ops)
+        self.assertIn("submit", ops)
+        typed = [c for c in drv.calls if c.get("op") == "type"]
+        self.assertEqual(typed[-1]["text"], "好")
+        kinds = {c.get("kind") for c in drv.calls if c.get("op") == "focus"}
+        self.assertIn("session", kinds)
+        self.assertIn("input", kinds)
+
+    def test_cli_refuse_group_and_empty(self):
+        proc = self._cli(["--send", "--peer", "独立产品创业联盟3群", "--text", "好"])
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        rec = self._last_json(proc.stdout)
+        self.assertFalse(rec["ok"])
+        self.assertEqual(rec["error"], "group")
+        self.assertEqual(rec["peer"], "独立产品创业联盟3群")
+        self.assertEqual(rec["text"], "好")
+
+        proc = self._cli(["send", "--peer", "collage group", "--text", "hi"])
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        rec = self._last_json(proc.stdout)
+        self.assertFalse(rec["ok"])
+        self.assertEqual(rec["error"], "group")
+
+        proc = self._cli(["send", "--peer", "阿坤", "--text", ""])
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        rec = self._last_json(proc.stdout)
+        self.assertFalse(rec["ok"])
+        self.assertEqual(rec["error"], "empty-text")
+        self.assertEqual(rec["peer"], "阿坤")
+
+        proc = self._cli(["--send", "--peer", "阿坤"])
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        rec = self._last_json(proc.stdout)
+        self.assertFalse(rec["ok"])
+        self.assertEqual(rec["error"], "empty-text")
+
+    def test_cli_dry_run_match_injected_sessions(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "sessions.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    [
+                        {"name": "阿坤"},
+                        {"name": "独立产品创业联盟3群"},
+                        {"name": "文件传输助手"},
+                    ],
+                    fh,
+                    ensure_ascii=False,
+                )
+            proc = self._cli(
+                [
+                    "--send",
+                    "--peer",
+                    "阿坤",
+                    "--text",
+                    "好",
+                    "--dry-run",
+                    "--sessions-json",
+                    path,
+                ]
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            rec = self._last_json(proc.stdout)
+            self.assertTrue(rec["ok"])
+            self.assertEqual(rec["peer"], "阿坤")
+            self.assertEqual(rec["text"], "好")
+            self.assertNotIn("error", rec)
+
+            proc = self._cli(
+                [
+                    "send",
+                    "--peer",
+                    "独立产品创业联盟3群",
+                    "--text",
+                    "好",
+                    "--dry-run",
+                    "--sessions-json",
+                    path,
+                ]
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            rec = self._last_json(proc.stdout)
+            self.assertFalse(rec["ok"])
+            self.assertEqual(rec["error"], "group")
+
+    def test_missing_args_mentions_send(self):
+        proc = self._cli([])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--send", proc.stderr)
+        self.assertIn("--normalize-nick", proc.stderr)
+
+
+
 if __name__ == "__main__":
     unittest.main()

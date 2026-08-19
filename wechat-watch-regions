@@ -34,6 +34,10 @@ Usage:
   wechat-watch-regions --fingerprint-json regions.json
   wechat-watch-regions --normalize-nick RAW
       # print nick= and ok=0|1; no PNG
+  wechat-watch-regions --send --peer PEER --text TEXT [--username USER]
+      [--dry-run] [--sessions-json FILE]
+      # 1:1 only; refuse groups / empty text / File Transfer / Weixin Team
+      # also: wechat-watch-regions send --peer PEER --text TEXT
 """
 from __future__ import annotations
 
@@ -3532,6 +3536,559 @@ def resolve_ffmpeg(ffmpeg: str) -> str:
     return "ffmpeg"
 
 
+
+
+class SendRefused(Exception):
+    """Safe abort before any keystroke: group, empty, skipped, no match."""
+
+    def __init__(self, error: str, peer: str = "", text: str = ""):
+        super().__init__(error)
+        self.error = error
+        self.peer = peer
+        self.text = text
+
+
+_SEND_TEXT_MAX = 200
+_SKIP_PEER_KEYS = (
+    "filetransfer",
+    "filehelper",
+    "文件传输助手",
+    "weixinteam",
+    "wechatteam",
+    "微信团队",
+)
+_GROUP_WORD_RE = re.compile(r"(?i)(^|[^a-z0-9])group([^a-z0-9]|$)")
+
+
+def looks_like_group(name: str) -> bool:
+    """True if the target is a group / chatroom, not a 1:1 peer."""
+    raw = (name or "").strip()
+    if not raw:
+        return False
+    nick = normalize_nick(raw) or raw
+    blob = f"{raw} {nick}"
+    low = blob.lower()
+    if "@chatroom" in low or "chatroom" in low:
+        return True
+    if "collage group" in low:
+        return True
+    if "独立产品创业联盟" in blob:
+        return True
+    if "群" in blob:
+        return True
+    if _GROUP_WORD_RE.search(low):
+        return True
+    return False
+
+
+def _compact_peer_key(name: str) -> str:
+    nick = normalize_nick(name or "") or (name or "")
+    return re.sub(r"[\s_\-]+", "", nick).lower()
+
+
+def is_skipped_peer(name: str) -> bool:
+    """File Transfer / Weixin Team are never a send target."""
+    key = _compact_peer_key(name)
+    if not key:
+        key = re.sub(r"[\s_\-]+", "", (name or "")).lower()
+    if not key:
+        return False
+    return any(tok in key or key in tok for tok in _SKIP_PEER_KEYS if tok)
+
+
+def validate_send(
+    peer: str | None,
+    text: str | None,
+    username: str | None = None,
+) -> dict:
+    """Refuse empty/multiline/group/skipped. No GUI. Raises SendRefused."""
+    peer_in = "" if peer is None else str(peer)
+    text_in = "" if text is None else str(text)
+    user_in = "" if username is None else str(username).strip()
+    if text_in.strip() == "":
+        raise SendRefused("empty-text", peer=peer_in, text=text_in)
+    if "\n" in text_in or "\r" in text_in:
+        raise SendRefused("multiline-text", peer=peer_in, text=text_in)
+    if len(text_in) > _SEND_TEXT_MAX:
+        raise SendRefused("text-too-long", peer=peer_in, text=text_in)
+    peer_n = normalize_nick(peer_in) or peer_in.strip()
+    if not peer_n and not user_in:
+        raise SendRefused("empty-peer", peer=peer_in, text=text_in)
+    for cand in (peer_in, peer_n, user_in):
+        if cand and looks_like_group(cand):
+            raise SendRefused("group", peer=peer_in or user_in, text=text_in)
+        if cand and is_skipped_peer(cand):
+            raise SendRefused("skipped-peer", peer=peer_in or user_in, text=text_in)
+    return {"peer": peer_n, "text": text_in, "username": user_in}
+
+
+def _session_name(rec) -> str:
+    if isinstance(rec, str):
+        return rec
+    if isinstance(rec, dict):
+        return str(rec.get("name") or rec.get("peer") or rec.get("title") or "")
+    return ""
+
+
+def _session_username(rec) -> str:
+    if isinstance(rec, dict):
+        return str(rec.get("username") or rec.get("user") or rec.get("wxid") or "")
+    return ""
+
+
+def _as_session(rec) -> dict:
+    if isinstance(rec, dict):
+        item = dict(rec)
+    else:
+        item = {"name": _session_name(rec)}
+    name = _session_name(item)
+    uname = _session_username(item)
+    item["name"] = name
+    if uname:
+        item["username"] = uname
+    return item
+
+
+def match_peer(
+    query: str,
+    sessions: list,
+    username: str | None = None,
+) -> dict:
+    """Pick one existing 1:1 row. Never groups, skipped peers, or new chats."""
+    q_raw = "" if query is None else str(query)
+    q = normalize_nick(q_raw) or q_raw.strip()
+    user_q = ("" if username is None else str(username)).strip()
+    if looks_like_group(q_raw) or looks_like_group(q) or looks_like_group(user_q):
+        raise SendRefused("group", peer=q_raw or user_q, text="")
+    if is_skipped_peer(q_raw) or is_skipped_peer(q) or is_skipped_peer(user_q):
+        raise SendRefused("skipped-peer", peer=q_raw or user_q, text="")
+
+    usable: list[dict] = []
+    for rec in sessions or []:
+        item = _as_session(rec)
+        name = item.get("name") or ""
+        uname = item.get("username") or ""
+        if not name and not uname:
+            continue
+        if looks_like_group(name) or looks_like_group(uname):
+            continue
+        if is_skipped_peer(name) or is_skipped_peer(uname):
+            continue
+        usable.append(item)
+
+    if user_q:
+        ul = user_q.lower()
+        uhits = [
+            it
+            for it in usable
+            if (_session_username(it) or "").strip().lower() == ul
+        ]
+        if len(uhits) == 1:
+            return uhits[0]
+        if len(uhits) > 1:
+            raise SendRefused("ambiguous-peer", peer=q_raw or user_q, text="")
+
+    if not q:
+        raise SendRefused("peer-not-found", peer=q_raw, text="")
+
+    ql = q.lower()
+    exact: list[dict] = []
+    prefix: list[dict] = []
+    for it in usable:
+        nm = normalize_nick(it.get("name") or "") or (it.get("name") or "").strip()
+        if not nm:
+            continue
+        nl = nm.lower()
+        if nm == q or nl == ql:
+            exact.append(it)
+        elif nl.startswith(ql) or ql.startswith(nl):
+            prefix.append(it)
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise SendRefused("ambiguous-peer", peer=q_raw, text="")
+    if len(prefix) == 1:
+        return prefix[0]
+    if len(prefix) > 1:
+        raise SendRefused("ambiguous-peer", peer=q_raw, text="")
+    raise SendRefused("peer-not-found", peer=q_raw, text="")
+
+
+def input_box_point(
+    win: tuple[int, int, int, int],
+    crops: dict[str, tuple[int, int, int, int]],
+) -> tuple[int, int]:
+    """Composer under the thread crop, left of a typical Send button."""
+    wx, wy, ww, wh = (int(v) for v in win)
+    thread = crops.get("thread") or (wx, wy, ww, wh)
+    tx, ty, tw, th = (int(v) for v in thread)
+    thread_bottom = ty + th
+    win_bottom = wy + wh
+    band = win_bottom - thread_bottom
+    if band >= 16:
+        third = tw // 3 if tw >= 3 else (tw // 2 or 1)
+        cx = tx + max(48, min(max(1, tw - 80), third))
+        cy = thread_bottom + max(10, band // 2)
+    else:
+        cx = tx + max(48, tw // 3 if tw >= 3 else max(1, tw // 2))
+        cy = ty + max(1, th - 16)
+    return (int(cx), int(cy))
+
+
+def list_row_point(
+    list_box: tuple[int, int, int, int],
+    rec: dict,
+    row_h: int = UNREAD_ROW_H,
+) -> tuple[int, int]:
+    lx, ly, lw, _lh = (int(v) for v in list_box)
+    if rec.get("x") is not None and rec.get("y") is not None:
+        x = int(rec["x"])
+        y = int(rec["y"])
+        w = int(rec.get("w") or max(1, lw))
+        h = int(rec.get("h") or row_h)
+        return (x + max(24, min(w, lw) // 3), y + max(8, h // 2))
+    idx = int(rec.get("row") if rec.get("row") is not None else rec.get("index") or 0)
+    cy = ly + idx * row_h + row_h // 2
+    cx = lx + max(24, min(max(1, lw) // 2, 80))
+    return (int(cx), int(cy))
+
+
+def sessions_from_row_recs(recs: list) -> list[dict]:
+    """Turn unread-like / OCR row dicts into send session records."""
+    out: list[dict] = []
+    for i, rec in enumerate(recs or []):
+        if isinstance(rec, str):
+            name = parse_row_title(rec)
+            if name:
+                out.append({"name": name, "row": i})
+            continue
+        if not isinstance(rec, dict):
+            continue
+        raw = str(rec.get("name") or rec.get("title") or rec.get("peer") or "")
+        name = parse_row_title(raw) or (normalize_nick(raw) or raw.strip())
+        if not name or not is_plausible_nick(name):
+            continue
+        item = {
+            "name": name,
+            "username": str(rec.get("username") or rec.get("user") or rec.get("wxid") or ""),
+            "row": rec.get("row", i),
+        }
+        for k in ("x", "y", "w", "h"):
+            if rec.get(k) is not None:
+                item[k] = rec[k]
+        out.append(item)
+    return out
+
+
+def sessions_from_atspi(
+    tree: str | None = None,
+    extents: list | None = None,
+) -> list[dict]:
+    """List-item-like rows from an injected AT-SPI dump. Tests inject text."""
+    recs: list[dict] = []
+    if extents is not None:
+        recs.extend(list(extents))
+    if tree is not None:
+        recs.extend(_parse_atspi_tree(tree))
+    out: list[dict] = []
+    for r in recs:
+        if not isinstance(r, dict):
+            continue
+        name = str(r.get("name") or "").replace("_", " ").strip()
+        role = str(r.get("role") or "").lower()
+        if not name or name.lower() in ("child", "wechat", "weixin", "微信"):
+            continue
+        if role in (
+            "frame",
+            "window",
+            "application",
+            "panel",
+            "page",
+            "document",
+            "list",
+            "scrollpane",
+            "filler",
+        ):
+            continue
+        item = {
+            "name": name,
+            "username": str(r.get("username") or ""),
+            "role": role,
+        }
+        for k in ("x", "y", "w", "h"):
+            if r.get(k) is not None:
+                item[k] = r[k]
+        out.append(item)
+    return sessions_from_row_recs(out)
+
+
+def load_sessions_json(path: str) -> list:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if isinstance(data, dict):
+        data = data.get("sessions") or data.get("peers") or []
+    if not isinstance(data, list):
+        raise SendRefused("bad-sessions", peer="", text="")
+    return sessions_from_row_recs(data)
+
+
+def plan_private_send(
+    *,
+    peer: str,
+    text: str,
+    username: str | None = None,
+    sessions: list | None = None,
+    win: tuple[int, int, int, int] | None = None,
+    crops: dict | None = None,
+) -> dict:
+    """Pure plan: validate, match existing 1:1, locate input. No desktop I/O."""
+    checked = validate_send(peer, text, username=username)
+    chosen = None
+    if sessions is not None:
+        chosen = match_peer(
+            checked["peer"] or peer,
+            sessions,
+            username=checked["username"] or username,
+        )
+        chosen_name = normalize_nick(chosen.get("name") or "") or checked["peer"]
+        checked["peer"] = chosen_name
+        if chosen.get("username") and not checked["username"]:
+            checked["username"] = str(chosen.get("username") or "")
+    win_box = win or (0, 0, FULL_DESKTOP[0], FULL_DESKTOP[1])
+    pane = crops or window_crops(*win_box)
+    inp = input_box_point(win_box, pane)
+    actions: list[dict] = []
+    if chosen is not None:
+        row_pt = list_row_point(pane["list"], chosen)
+        actions.append({"op": "focus-session", "x": row_pt[0], "y": row_pt[1]})
+    actions.append({"op": "focus-input", "x": inp[0], "y": inp[1]})
+    actions.append({"op": "type", "text": checked["text"]})
+    actions.append({"op": "submit"})
+    banned = {"search", "add-contact", "new-chat", "compose-new"}
+    if any(step.get("op") in banned for step in actions):
+        raise SendRefused("unsafe-action", peer=checked["peer"], text=checked["text"])
+    return {
+        "peer": checked["peer"],
+        "text": checked["text"],
+        "username": checked["username"],
+        "session": chosen,
+        "input": inp,
+        "actions": actions,
+    }
+
+
+def emit_send_result(ok: bool, peer: str, text: str, error: str = "") -> None:
+    rec = {"ok": bool(ok), "peer": peer, "text": text}
+    if error:
+        rec["error"] = error
+    print(json.dumps(rec, ensure_ascii=False, separators=(",", ":")))
+
+
+class DrySendDriver:
+    """Records planned actions. Never talks to X11 / AT-SPI."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def raise_window(self, win_id: str | None = None) -> None:
+        self.calls.append({"op": "raise", "id": win_id or ""})
+
+    def focus_xy(self, x: int, y: int, kind: str) -> None:
+        self.calls.append({"op": "focus", "kind": kind, "x": int(x), "y": int(y)})
+
+    def type_text(self, text: str) -> None:
+        self.calls.append({"op": "type", "text": text})
+
+    def submit(self) -> None:
+        self.calls.append({"op": "submit"})
+
+
+def execute_send_plan(plan: dict, driver: DrySendDriver) -> None:
+    banned = {"search", "add-contact", "new-chat", "compose-new"}
+    for step in plan.get("actions") or []:
+        op = step.get("op")
+        if op in banned:
+            raise SendRefused(
+                "unsafe-action",
+                peer=str(plan.get("peer") or ""),
+                text=str(plan.get("text") or ""),
+            )
+        if op == "focus-session":
+            driver.focus_xy(int(step["x"]), int(step["y"]), "session")
+        elif op == "focus-input":
+            driver.focus_xy(int(step["x"]), int(step["y"]), "input")
+        elif op == "type":
+            driver.type_text(str(step.get("text") or ""))
+        elif op == "submit":
+            driver.submit()
+
+
+def rewrite_send_argv(argv: list[str]) -> list[str]:
+    """Allow `wechat-watch-regions send --peer X --text Y` as well as --send."""
+    if len(argv) > 1 and argv[1] == "send":
+        return [argv[0], "--send", *argv[2:]]
+    return argv
+
+
+def sessions_from_list_png(path: str, ffmpeg: str) -> list[dict]:
+    """OCR persist list.png row titles. Read-only helper for --send matching."""
+    if not path or not os.path.isfile(path):
+        return []
+    try:
+        w, h = png_size(path)
+    except (OSError, ValueError):
+        return []
+    src = unread_source_box(w, h)
+    cx = cy = 0
+    cw, ch = w, h
+    if src is not None:
+        cx, cy, cw, ch = src
+    bands = unread_row_bands(ch)
+    out: list[dict] = []
+    with tempfile.TemporaryDirectory(prefix="wechat-watch-send-list-") as td:
+        work = path
+        if src is not None and src != (0, 0, w, h):
+            work = os.path.join(td, "list.png")
+            try:
+                crop_png(ffmpeg, path, work, src)
+            except (OSError, subprocess.CalledProcessError):
+                return []
+        for i, (y, bh) in enumerate(bands):
+            nx = min(cw - 1, 56)
+            nw = max(1, min(220, cw - nx - 36))
+            nh = max(1, min(36, bh))
+            ny = max(0, y + 4)
+            if ny + nh > ch:
+                nh = max(1, ch - ny)
+            dest = os.path.join(td, f"row{i}.png")
+            try:
+                crop_png(ffmpeg, work, dest, (nx, ny, nw, nh))
+            except (OSError, subprocess.CalledProcessError):
+                continue
+            raw = run_tesseract(dest, pick_psm((nx, ny, nw, nh)), lang="chi_sim+eng")
+            name = parse_row_title(raw)
+            if not name:
+                continue
+            out.append(
+                {
+                    "name": name,
+                    "row": i,
+                    "x": cx + nx,
+                    "y": cy + ny,
+                    "w": nw,
+                    "h": nh,
+                }
+            )
+    return out
+
+def run_send(
+    peer: str,
+    text: str,
+    username: str | None = None,
+    sessions: list | None = None,
+    dry_run: bool = True,
+    driver=None,
+    env: dict | None = None,
+    tree_text: str | None = None,
+    wm_text: str | None = None,
+    atspi_tree: str | None = None,
+    atspi_extents: list | None = None,
+    probe_window: bool = False,
+) -> dict:
+    checked = validate_send(peer, text, username=username)
+    win, source = find_window(
+        env=env, tree_text=tree_text, wm_text=wm_text, probe=probe_window
+    )
+    pane = window_crops(*win)
+    sess: list = list(sessions) if sessions is not None else []
+    if sessions is None and (atspi_tree is not None or atspi_extents is not None):
+        sess = sessions_from_atspi(tree=atspi_tree, extents=atspi_extents)
+    elif sessions is None and not dry_run:
+        png = os.path.join(default_persist(), "watch", "list.png")
+        if os.path.isfile(png):
+            try:
+                sess = sessions_from_list_png(png, resolve_ffmpeg(default_ffmpeg()))
+            except (OSError, ValueError, subprocess.CalledProcessError):
+                sess = []
+    if sessions is not None or sess:
+        plan = plan_private_send(
+            peer=checked['peer'],
+            text=checked['text'],
+            username=checked['username'] or username,
+            sessions=sess,
+            win=win,
+            crops=pane,
+        )
+    else:
+        if not dry_run:
+            raise SendRefused('peer-not-found', peer=checked['peer'], text=checked['text'])
+        plan = plan_private_send(
+            peer=checked['peer'],
+            text=checked['text'],
+            username=checked['username'],
+            sessions=None,
+            win=win,
+            crops=pane,
+        )
+    if dry_run:
+        return {
+            'ok': True,
+            'peer': plan['peer'],
+            'text': plan['text'],
+            'dry_run': True,
+            'plan': plan,
+            'source': source,
+        }
+    if driver is not None:
+        execute_send_plan(plan, driver)
+        return {'ok': True, 'peer': plan['peer'], 'text': plan['text']}
+    apply = None
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        from wechat_watch_apply import apply_private_text as apply
+    except Exception:
+        apply = None
+    if apply is None or not apply(plan['peer'], plan['text']):
+        raise SendRefused('no-input-driver', peer=plan['peer'], text=plan['text'])
+    return {'ok': True, 'peer': plan['peer'], 'text': plan['text']}
+
+def cli_send(args) -> int:
+    peer = '' if args.peer is None else str(args.peer)
+    text = '' if args.text is None else str(args.text)
+    username = args.username
+    env_dry = (os.environ.get('WECHAT_SEND_DRY') or '').strip().lower()
+    dry = bool(args.dry_run) or env_dry in ('1', 'true', 'yes')
+    sessions = None
+    if args.sessions_json:
+        try:
+            sessions = load_sessions_json(args.sessions_json)
+        except (OSError, json.JSONDecodeError, SendRefused) as exc:
+            emit_send_result(False, peer, text, error='bad-sessions')
+            print(f'ERROR: send sessions: {exc}', file=sys.stderr)
+            return 2
+    try:
+        result = run_send(
+            peer,
+            text,
+            username=username,
+            sessions=sessions,
+            dry_run=dry,
+            probe_window=False,
+        )
+    except SendRefused as exc:
+        emit_send_result(
+            False,
+            exc.peer or peer,
+            exc.text if exc.text != '' else text,
+            error=exc.error,
+        )
+        return 2
+    emit_send_result(True, result['peer'], result['text'])
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="WeChat list/thread region crops + OCR")
     p.add_argument("--prev", help="previous list.png or thread.png")
@@ -3674,7 +4231,30 @@ def main() -> int:
         metavar="RAW",
         help="normalize a nickname/session name; print nick= and ok=0|1 (no PNG)",
     )
-    args = p.parse_args()
+    p.add_argument(
+        "--send",
+        action="store_true",
+        help="send one short 1:1 text in the existing WeChat window (never groups)",
+    )
+    p.add_argument("--peer", help="1:1 session display name for --send")
+    p.add_argument("--text", help="short text for --send")
+    p.add_argument(
+        "--username",
+        help="optional wxid / username for --send (never @chatroom)",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="with --send: validate/match only; never type into WeChat",
+    )
+    p.add_argument(
+        "--sessions-json",
+        help="with --send: injected session list (tests / no GUI)",
+    )
+    args = p.parse_args(rewrite_send_argv(sys.argv)[1:])
+
+    if args.send:
+        return cli_send(args)
 
     if args.normalize_nick is not None:
         nick = normalize_nick(args.normalize_nick)
@@ -3855,7 +4435,7 @@ def main() -> int:
         return 0
 
     if not args.prev or not args.curr:
-        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread / --detect-nav / --cache-images / --classify / --detect-time / --window-geom / --fingerprint / --fingerprint-json / --normalize-nick")
+        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread / --detect-nav / --cache-images / --classify / --detect-time / --window-geom / --fingerprint / --fingerprint-json / --normalize-nick / --send")
     if not args.out_dir or not args.json:
         p.error("--out-dir and --json are required unless --detect-scroll / --parse-frames / --should-record")
 

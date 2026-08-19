@@ -7,7 +7,7 @@
 
 仓库：[https://github.com/nicechencs/wechat-watch](https://github.com/nicechencs/wechat-watch)
 
-本工具**只截屏、对比、识别文字**，不会打开微信、不会登录、不会发消息。
+本工具默认**只截屏、对比、识别文字**，不会打开微信、不会登录。可选的 1:1 `--send` 只向**已经存在的私聊**发一条短文本；群聊（`@chatroom` / 独立产品创业联盟3群 / collage group）、文件传输助手、Weixin Team 一律拒绝。
 
 ## 它解决什么问题
 
@@ -124,6 +124,9 @@ sudo chmod 0755 /home/box/.local/bin/wechat-watch-diff "$PERSIST/wechat-watch-gc
 ```bash
 export DISPLAY="${DISPLAY:-:8}"
 ./wechat-watch-diff
+
+# 已登录窗口里给已有私聊发一条短文本（不要对群用）
+./wechat-watch-regions --send --peer '阿坤' --text '好'
 ```
 
 ### 没有变化
@@ -196,6 +199,10 @@ unread0=5
 # 会话名 / 群昵称清洗（空昵称、OCR 噪点、残留表情），不需要 PNG
 ./wechat-watch-regions --normalize-nick "陈"
 
+# 已有 1:1 会话发一条短文本（群 / 文件传输助手 / Weixin Team 拒绝）
+./wechat-watch-regions --send --peer '阿坤' --text '好'
+./wechat-watch-regions send --peer '阿坤' --text '好'
+
 # 当前微信窗口矩形 + nav/list/thread 裁剪（找不到则 1280x800 常量）
 ./wechat-watch-regions --window-geom
 # 有窗口截图时扫描 gutter，list/thread 跟分隔线而不是固定 63/282
@@ -265,7 +272,7 @@ unread0=5
 python3 tests/test_regions.py
 ```
 
-当前覆盖：假色块切框、徽章保留、大面积变化回退、中英 OCR、CLI 的 `textN=` / `kindN=`、thread 尺寸切框、左右气泡 → `in`/`out`、滚动检测、列表变化不录像、头像 average-hash、identities 绑定、时间线 JSON、`wechat-watch-gc` 过期删除、UTC/Asia/Shanghai 双时区、`wechat-watch-thread --png` 只读 OCR、列表右侧未读标记（红数字 / 红点 / `[N条]`）以及 10 秒循环的 `unreadN=`、窗口 gutter 扫描（移动 vs 缩放 / DPI）、窗口 id 解析、列表 text0 指纹 / flap、注入式 AT-SPI 探测、image-bubble read-only cache / `--cache-images`、像素先分类 / `--classify`、时间分隔条 / `--detect-time`、会话名 / 昵称 `normalize_nick`。
+当前覆盖：假色块切框、徽章保留、大面积变化回退、中英 OCR、CLI 的 `textN=` / `kindN=`、thread 尺寸切框、左右气泡 → `in`/`out`、滚动检测、列表变化不录像、头像 average-hash、identities 绑定、时间线 JSON、`wechat-watch-gc` 过期删除、UTC/Asia/Shanghai 双时区、`wechat-watch-thread --png` 只读 OCR、列表右侧未读标记（红数字 / 红点 / `[N条]`）以及 10 秒循环的 `unreadN=`、窗口 gutter 扫描（移动 vs 缩放 / DPI）、窗口 id 解析、列表 text0 指纹 / flap、注入式 AT-SPI 探测、image-bubble read-only cache / `--cache-images`、像素先分类 / `--classify`、时间分隔条 / `--detect-time`、会话名 / 昵称 `normalize_nick`、1:1 `--send`（拒群 / 拒空文本 / 会话匹配）。
 
 ## 运行时文件（不进 git）
 
@@ -299,11 +306,13 @@ wechat-watch/
 ├── README.md               本文件
 ├── CONTRIBUTING.md         贡献说明
 ├── docs/group-handling.md  群聊处理办法（信号 / 右侧翻历史 / 不发言 / 摘要仓库）
+├── wechat-watch.py         薄入口：`python3 wechat-watch.py send --peer … --text …`
 ├── wechat-watch-diff       Bash 入口：列表哈希、滚动才录像、GC
-├── wechat-watch-regions    Python：差分切框 + OCR + 滚动检测 + 时间线 + 双时区 + 未读标记
+├── wechat-watch-regions    Python：差分切框 + OCR + 滚动检测 + 时间线 + 双时区 + 未读标记 + 1:1 --send
+├── wechat_watch_apply.py   --send 实况：已有窗口上的 AT-SPI 写文本（测试不走这里）
 ├── wechat-watch-thread     只读：裁右侧对话区并 OCR，打印文本给 summaries
 ├── wechat-watch-gc         过期删除录像/截图，只留识别结果
-└── tests/test_regions.py   单元测试
+└── tests/test_regions.py   单元测试（含 1:1 send 拒群 / 拒空 / 匹配）
 ```
 
 ## 群聊 / 右侧对话区
