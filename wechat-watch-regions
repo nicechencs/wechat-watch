@@ -26,6 +26,7 @@ Usage:
   wechat-watch-regions --cache-images THREAD.png [--images-dir DIR]
       # read-only image-bubble crops; local persist only, never sent
   wechat-watch-regions --classify THREAD.png
+  wechat-watch-regions --detect-time THREAD.png
   wechat-watch-regions --window-geom [--window-png WIN.png]
       # win/nav/list/thread + source= + id=; PNG scans gutters inside the window
   wechat-watch-regions --fingerprint TEXT
@@ -3004,6 +3005,239 @@ def detect_and_classify(rgb: bytes, w: int, h: int) -> list[dict]:
     return recs
 
 
+# WeChat thread time/date divider chips (centered gray: 今天 16:04 / 昨天 / 年月日).
+_HHMM = r"(\d{1,2})\s*[:：.]\s*(\d{2})"
+_HHMM_RE = re.compile(r"(?<!\d)" + _HHMM + r"(?!\d)")
+TIME_DIVIDER_RE = re.compile(
+    r"(?:"
+    r"刚刚|"
+    r"just\s*now|"
+    r"今天|"
+    r"昨天|"
+    r"today|"
+    r"yesterday|"
+    r"星期[一二三四五六日天]|"
+    r"(?:\d{4}\s*年\s*)?\d{1,2}\s*月\s*\d{1,2}\s*日|"
+    r"(?<!\d)\d{1,2}\s*[:：.]\s*\d{2}(?!\d)"
+    r")",
+    re.IGNORECASE,
+)
+_TIME_OCR_KEEP_RE = re.compile(
+    r"刚刚|今天|昨天|today|yesterday|just\s*now|"
+    r"(?<!\d)\d{1,2}\s*[:：.]\s*\d{2}(?!\d)",
+    re.IGNORECASE,
+)
+TIME_CHIP_MAX_H = 48
+TIME_CHIP_MIN_W = 40
+TIME_CHIP_MAX_W_FRAC = 0.85
+TIME_CHIP_CENTER_FRAC = 0.22
+TIME_OCR_PAD = 6
+
+
+def parse_time_divider(text: str) -> dict | None:
+    """Parse OCR raw from a WeChat time/date divider chip.
+
+    Always keeps the raw string when the text looks time-like. Does not
+    require a perfect datetime (OCR may drop CJK).
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if not TIME_DIVIDER_RE.search(raw):
+        return None
+    rec: dict = {"text": raw, "raw": raw}
+    hm = _HHMM_RE.search(raw)
+    if hm:
+        rec["hh"] = int(hm.group(1))
+        rec["mm"] = int(hm.group(2))
+    low = raw.lower()
+    if "刚刚" in raw or "just now" in low:
+        rec["kind"] = "just_now"
+    elif "今天" in raw or re.search(r"\btoday\b", low):
+        rec["kind"] = "today"
+    elif "昨天" in raw or re.search(r"\byesterday\b", low):
+        rec["kind"] = "yesterday"
+    elif "星期" in raw:
+        rec["kind"] = "weekday"
+    elif "月" in raw and "日" in raw:
+        rec["kind"] = "date"
+    elif hm:
+        rec["kind"] = "clock"
+    return rec
+
+
+def _is_photo_block(box: tuple[int, int, int, int]) -> bool:
+    _x, _y, bw, bh = box
+    return (
+        bw >= IMAGE_MIN_SIDE
+        and bh >= IMAGE_MIN_SIDE
+        and bw * bh >= IMAGE_MIN_AREA
+    )
+
+
+def _is_time_chip(box: tuple[int, int, int, int], w: int, h: int) -> bool:
+    """Short centered chip, not a left/right bubble, not a large image."""
+    x, _y, bw, bh = box
+    if bw <= 0 or bh <= 0 or w <= 0 or h <= 0:
+        return False
+    if _is_photo_block(box):
+        return False
+    if bh > TIME_CHIP_MAX_H:
+        return False
+    if bw < TIME_CHIP_MIN_W or bw > TIME_CHIP_MAX_W_FRAC * w:
+        return False
+    mid = x + bw / 2.0
+    if abs(mid - w / 2.0) > TIME_CHIP_CENTER_FRAC * w:
+        return False
+    frame_mid = w / 2.0
+    spans_center = x < frame_mid < (x + bw)
+    if x <= 0.08 * w and not spans_center:
+        return False
+    if (x + bw) >= 0.92 * w and not spans_center:
+        return False
+    return True
+
+
+def _time_keep_ocr(text: str) -> bool:
+    if parse_time_divider(text) is not None:
+        return True
+    return bool(text and _TIME_OCR_KEEP_RE.search(text))
+
+
+def _extra_time_chip_boxes(
+    rgb: bytes, w: int, h: int
+) -> list[tuple[int, int, int, int]]:
+    """Thin centered chips that classify / nest may have missed."""
+    if w <= 0 or h <= 0 or not rgb:
+        return []
+    br, bg, bb = estimate_background_rgb(rgb, w, h)
+    n = w * h
+    mask = bytearray(n)
+    for i in range(n):
+        o = i * 3
+        if (
+            abs(rgb[o] - br) > THRESH
+            or abs(rgb[o + 1] - bg) > THRESH
+            or abs(rgb[o + 2] - bb) > THRESH
+        ):
+            mask[i] = 1
+    mask = denoise(mask, w, h)
+    boxes = merge_boxes(components(mask, w, h), MERGE_GAP)
+    return [b for b in boxes if _is_time_chip(b, w, h)]
+
+
+def _write_rgb24_png(
+    ffmpeg: str, rgb: bytes, w: int, h: int, dest: str
+) -> None:
+    raw_path = dest + ".rgb"
+    with open(raw_path, "wb") as fh:
+        fh.write(rgb)
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{w}x{h}",
+        "-i",
+        raw_path,
+        "-frames:v",
+        "1",
+        "-update",
+        "1",
+        dest,
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def _dedup_time_boxes(
+    boxes: list[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int]]:
+    ordered = sorted(boxes, key=lambda b: (b[1], b[0]))
+    kept: list[tuple[int, int, int, int]] = []
+    for box in ordered:
+        if any(_box_iou(box, prev) > 0.4 for prev in kept):
+            continue
+        kept.append(box)
+    return kept
+
+
+def detect_time_dividers(
+    thread_png: str | None = None,
+    *,
+    rgb: bytes | None = None,
+    w: int = 0,
+    h: int = 0,
+    ffmpeg: str | None = None,
+) -> list[dict]:
+    """Pixel-first time/date divider chips; OCR only those thin boxes."""
+    ff = resolve_ffmpeg(ffmpeg or default_ffmpeg())
+    src_png = thread_png if thread_png and os.path.isfile(thread_png) else None
+    with tempfile.TemporaryDirectory(prefix="wechat-watch-time-") as td:
+        if src_png:
+            w, h = png_size(src_png)
+            if rgb is None:
+                rgb = decode_rgb24(ff, src_png, w, h, os.path.join(td, "t.rgb"))
+        if rgb is None or w <= 0 or h <= 0:
+            return []
+        classified = detect_and_classify(rgb, w, h)
+        candidates: list[tuple[int, int, int, int]] = []
+        for rec in classified:
+            kind = rec.get("kind")
+            box = rec["box"]
+            if kind == "image":
+                continue
+            if _is_photo_block(box):
+                continue
+            if kind == "line":
+                candidates.append(box)
+            elif _is_time_chip(box, w, h):
+                candidates.append(box)
+        for box in _extra_time_chip_boxes(rgb, w, h):
+            candidates.append(box)
+        candidates = _dedup_time_boxes(candidates)
+        if not src_png:
+            src_png = os.path.join(td, "frame.png")
+            try:
+                _write_rgb24_png(ff, rgb, w, h, src_png)
+            except (OSError, subprocess.CalledProcessError):
+                return []
+        recs: list[dict] = []
+        for i, box in enumerate(candidates):
+            crop_box = pad_box(box, w, h, TIME_OCR_PAD)
+            crop = os.path.join(td, f"chip{i}.png")
+            try:
+                crop_png(ff, src_png, crop, crop_box)
+            except (OSError, subprocess.CalledProcessError):
+                continue
+            text, _kind = ocr_png(crop, crop_box)
+            text = (text or "").strip()
+            if not _time_keep_ocr(text):
+                continue
+            x, y, bw, bh = (int(box[0]), int(box[1]), int(box[2]), int(box[3]))
+            recs.append({"box": (x, y, bw, bh), "text": text, "kind": "time"})
+        recs.sort(key=lambda rec: (rec["box"][1], rec["box"][0]))
+        out: list[dict] = []
+        for rec in recs:
+            if any(_box_iou(rec["box"], prev["box"]) > 0.4 for prev in out):
+                continue
+            out.append(rec)
+        return out
+
+
+def emit_times_stdout(recs: list[dict]) -> None:
+    print(f"times={len(recs)}")
+    for i, rec in enumerate(recs):
+        x, y, bw, bh = rec["box"]
+        print(f"time{i}={rec.get('text') or ''}")
+        print(f"box{i}={x},{y},{bw},{bh}")
+
+
 def cache_images(
     thread_png: str,
     images_dir: str,
@@ -3186,6 +3420,11 @@ def main() -> int:
         help="pixel-first UIED-inspired region kinds (image/text/line/chrome); no OCR",
     )
     p.add_argument(
+        "--detect-time",
+        metavar="THREAD.png",
+        help="read-only: centered time/date divider chips (今天 16:04 / 昨天 / 年月日)",
+    )
+    p.add_argument(
         "--images-dir",
         help="hashed image crops (default: $WECHAT_PERSIST/watch/images)",
     )
@@ -3306,6 +3545,15 @@ def main() -> int:
             print(f"kind={rec['kind']}")
         return 0
 
+    if args.detect_time:
+        if not os.path.isfile(args.detect_time):
+            print(f"ERROR: thread png missing: {args.detect_time}", file=sys.stderr)
+            return 2
+        ffmpeg = resolve_ffmpeg(args.ffmpeg)
+        recs = detect_time_dividers(args.detect_time, ffmpeg=ffmpeg)
+        emit_times_stdout(recs)
+        return 0
+
     if args.should_record:
         rec = should_record_scroll(bool(args.list_changed), bool(args.scrolling))
         print(f"record={1 if rec else 0}")
@@ -3370,7 +3618,7 @@ def main() -> int:
         return 0
 
     if not args.prev or not args.curr:
-        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread / --detect-nav / --cache-images / --classify / --window-geom / --fingerprint / --fingerprint-json")
+        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still / --detect-unread / --detect-nav / --cache-images / --classify / --detect-time / --window-geom / --fingerprint / --fingerprint-json")
     if not args.out_dir or not args.json:
         p.error("--out-dir and --json are required unless --detect-scroll / --parse-frames / --should-record")
 

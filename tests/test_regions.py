@@ -1770,6 +1770,42 @@ def write_image_and_text_png(
     os.replace(tmp, path)
 
 
+def write_time_chip_png(
+    path: str,
+    text: str = "Today 16:04",
+    w: int = 720,
+    h: int = 400,
+) -> None:
+    """White canvas + thin centered gray time chip + drawtext on the chip."""
+    chip = (260, 90, 200, 32)
+    write_box_png(path, w, h, chip, color="0xB4B4B4", bg="white")
+    ffmpeg = SYSTEM_FFMPEG if os.path.isfile(SYSTEM_FFMPEG) else "ffmpeg"
+    cx, cy, cw, ch = chip
+    # drawtext treats ':' as an option separator; escape clock colons.
+    drawn = text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    vf = (
+        f"drawtext=fontfile={CJK_FONT}:text='{drawn}':"
+        f"fontcolor=0x333333:fontsize=20:"
+        f"x={cx}+({cw}-text_w)/2:y={cy}+({ch}-text_h)/2"
+    )
+    tmp = path + ".time.png"
+    run_ffmpeg(
+        ffmpeg,
+        [
+            "-i",
+            path,
+            "-vf",
+            vf,
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            tmp,
+        ],
+    )
+    os.replace(tmp, path)
+
+
 class ImageCacheTests(unittest.TestCase):
     """Read-only image-bubble detect + persist cache. No GUI, no send."""
 
@@ -2065,6 +2101,99 @@ class ClassifyRegionTests(unittest.TestCase):
             src = fh.read()
         self.assertNotIn("--classify", src)
         self.assertNotIn("classify_region", src)
+
+
+class TimeDividerTests(unittest.TestCase):
+    """Centered WeChat time/date chips. Pixel-first, OCR only those boxes."""
+
+    def test_parse_time_divider_units(self):
+        self.assertIsNotNone(regions.parse_time_divider("今天 16:04"))
+        self.assertIsNotNone(regions.parse_time_divider("Today 16:04"))
+        self.assertIsNone(regions.parse_time_divider("hello world"))
+
+    def test_synthetic_chip_cli_and_api(self):
+        self.assertTrue(os.path.isfile(PERSIST_FFMPEG), "persist ffmpeg missing")
+        self.assertTrue(os.path.isfile(CJK_FONT), f"missing CJK font: {CJK_FONT}")
+        raw = "Today 16:04"
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-time-") as td:
+            thread = os.path.join(td, "thread.png")
+            write_time_chip_png(thread, raw)
+            recs = regions.detect_time_dividers(thread, ffmpeg=PERSIST_FFMPEG)
+            self.assertGreaterEqual(len(recs), 1, recs)
+            rec = recs[0]
+            self.assertEqual(rec["kind"], "time")
+            self.assertTrue(
+                "16:04" in rec["text"] or raw in rec["text"],
+                rec,
+            )
+            x, y, bw, bh = rec["box"]
+            self.assertLess(bw, 600, rec)
+            self.assertLess(bh, 80, rec)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "--detect-time",
+                    thread,
+                    "--ffmpeg",
+                    PERSIST_FFMPEG,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            parsed = _parse_unread_stdout(proc.stdout)
+            n = int(parsed.get("times", "0"))
+            self.assertGreaterEqual(n, 1, proc.stdout)
+            time0 = parsed.get("time0", "")
+            self.assertTrue(
+                "16:04" in time0 or raw in time0,
+                proc.stdout,
+            )
+
+    def test_teal_image_block_is_not_a_time(self):
+        self.assertTrue(os.path.isfile(PERSIST_FFMPEG), "persist ffmpeg missing")
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-time-img-") as td:
+            thread = os.path.join(td, "thread.png")
+            write_image_and_text_png(thread)
+            recs = regions.detect_time_dividers(thread, ffmpeg=PERSIST_FFMPEG)
+            self.assertEqual(recs, [], recs)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "--detect-time",
+                    thread,
+                    "--ffmpeg",
+                    PERSIST_FFMPEG,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            parsed = _parse_unread_stdout(proc.stdout)
+            self.assertEqual(int(parsed.get("times", "0")), 0, proc.stdout)
+            self.assertNotIn("time0=", proc.stdout)
+
+    def test_cli_missing_png_exits_2(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                SCRIPT,
+                "--detect-time",
+                "/no/such/thread.png",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("ERROR", proc.stderr)
+
+    def test_diff_does_not_call_detect_time(self):
+        with open(os.path.join(ROOT, "wechat-watch-diff"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertNotIn("--detect-time", src)
+        self.assertNotIn("detect_time_dividers", src)
 
 
 if __name__ == "__main__":
