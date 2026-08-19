@@ -773,5 +773,171 @@ class DiffScriptContractTests(unittest.TestCase):
         self.assertIn("run_gc", changed_tail)
 
 
+
+class SummaryTimeTests(unittest.TestCase):
+    def test_known_utc_instant_labels_shanghai(self):
+        from datetime import datetime, timezone
+
+        when = datetime(2026, 8, 19, 7, 2, 0, tzinfo=timezone.utc)
+        times = regions.format_summary_times(when)
+        self.assertEqual(times["utc"], "2026-08-19T07:02:00+00:00")
+        self.assertEqual(times["shanghai"], "2026-08-19T15:02:00+08:00")
+        self.assertEqual(times["utc_label"], "UTC")
+        self.assertEqual(times["shanghai_label"], "Asia/Shanghai")
+
+    def test_naive_when_is_utc(self):
+        from datetime import datetime
+
+        times = regions.format_summary_times(datetime(2026, 1, 1, 0, 0, 0))
+        self.assertEqual(times["utc"], "2026-01-01T00:00:00+00:00")
+        self.assertEqual(times["shanghai"], "2026-01-01T08:00:00+08:00")
+
+    def test_parse_when_z_and_offset(self):
+        dt = regions.parse_when("2026-08-19T07:02:00Z")
+        self.assertEqual(regions.format_summary_times(dt)["shanghai"], "2026-08-19T15:02:00+08:00")
+        dt2 = regions.parse_when("2026-08-19T15:02:00+08:00")
+        self.assertEqual(regions.format_summary_times(dt2)["utc"], "2026-08-19T07:02:00+00:00")
+
+    def test_cli_format_time(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                SCRIPT,
+                "--format-time",
+                "--when",
+                "2026-08-19T07:02:00+00:00",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn("at_utc=2026-08-19T07:02:00+00:00", proc.stdout)
+        self.assertIn("at_shanghai=2026-08-19T15:02:00+08:00", proc.stdout)
+
+    def test_crop_constants_match_diff_script(self):
+        self.assertEqual(regions.LIST_CROP, (440, 700, 70, 30))
+        self.assertEqual(regions.THREAD_CROP, (720, 660, 414, 40))
+        with open(os.path.join(ROOT, "wechat-watch-diff"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("CROP_W=440", src)
+        self.assertIn("CROP_H=700", src)
+        self.assertIn("CROP_X=70", src)
+        self.assertIn("CROP_Y=30", src)
+        self.assertIn("THREAD_W=720", src)
+        self.assertIn("THREAD_H=660", src)
+        self.assertIn("THREAD_X=414", src)
+        self.assertIn("THREAD_Y=40", src)
+
+
+class ThreadHelperTests(unittest.TestCase):
+    HELPER = os.path.join(ROOT, "wechat-watch-thread")
+    DOC = os.path.join(ROOT, "docs", "group-handling.md")
+
+    def test_helper_is_readonly_and_uses_thread_crop(self):
+        self.assertTrue(os.path.isfile(self.HELPER))
+        self.assertTrue(os.access(self.HELPER, os.X_OK))
+        with open(self.HELPER, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("THREAD_W=720", src)
+        self.assertIn("THREAD_H=660", src)
+        self.assertIn("THREAD_X=414", src)
+        self.assertIn("THREAD_Y=40", src)
+        self.assertIn("--ocr-still", src)
+        self.assertIn("wechat-group-summaries", src)
+        self.assertIn("never_send=1", src)
+        self.assertIn("list_is_signal_only=1", src)
+        self.assertNotIn("compose", src.lower())
+
+    def test_helper_png_ocrs_thread_and_prints_dual_times(self):
+        self.assertTrue(os.path.isfile(CJK_FONT), "missing CJK font: %s" % CJK_FONT)
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-th-") as td:
+            png = os.path.join(td, "thread.png")
+            write_text_png(png, KNOWN_ZH, w=720, h=660)
+            out_json = os.path.join(td, "out.json")
+            watch = os.path.join(td, "watch")
+            os.makedirs(watch)
+            proc = subprocess.run(
+                [
+                    "bash",
+                    self.HELPER,
+                    "--png",
+                    png,
+                    "--json",
+                    out_json,
+                    "--when",
+                    "2026-08-19T07:02:00+00:00",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "WECHAT_WATCH_DIR": watch,
+                    "WECHAT_PERSIST": os.path.dirname(watch),
+                },
+            )
+            self.assertIn("never_send=1", proc.stdout)
+            self.assertIn("list_is_signal_only=1", proc.stdout)
+            self.assertIn("summaries_repo=wechat-group-summaries", proc.stdout)
+            self.assertIn("at_utc=2026-08-19T07:02:00+00:00", proc.stdout)
+            self.assertIn("at_shanghai=2026-08-19T15:02:00+08:00", proc.stdout)
+            self.assertIn("source=thread", proc.stdout)
+            self.assertIn("crop=720x660+414+40", proc.stdout)
+            self.assertTrue(os.path.isfile(out_json))
+            with open(out_json, encoding="utf-8") as fh:
+                recs = json.loads(fh.read())
+            self.assertGreaterEqual(len(recs), 1)
+            joined = " ".join(r.get("text", "") for r in recs)
+            self.assertTrue(
+                KNOWN_ZH[0] in joined or KNOWN_ZH in joined,
+                "thread OCR missed known chars: %r" % recs,
+            )
+
+    def test_cli_ocr_still(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-watch-still-") as td:
+            png = os.path.join(td, "thread.png")
+            write_text_png(png, KNOWN_EN, w=720, h=160)
+            out_json = os.path.join(td, "out.json")
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "--ocr-still",
+                    png,
+                    "--json",
+                    out_json,
+                    "--when",
+                    "2026-08-19T07:02:00Z",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("never_send=1", proc.stdout)
+            self.assertIn("at_shanghai=2026-08-19T15:02:00+08:00", proc.stdout)
+            self.assertTrue(os.path.isfile(out_json))
+
+    def test_group_doc_states_required_method(self):
+        self.assertTrue(os.path.isfile(self.DOC))
+        with open(self.DOC, encoding="utf-8") as fh:
+            doc = fh.read()
+        for needle in (
+            "列表预览只是信号",
+            "必须点进群",
+            "右侧对话区",
+            "独立产品创业联盟3群",
+            "wechat-group-summaries",
+            "Asia/Shanghai",
+            "440x700+70+30",
+            "720x660+414+40",
+            "identities.json",
+            "wechat-watch-gc",
+        ):
+            self.assertIn(needle, doc)
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+            readme = fh.read()
+        self.assertIn("docs/group-handling.md", readme)
+
+
 if __name__ == "__main__":
     unittest.main()

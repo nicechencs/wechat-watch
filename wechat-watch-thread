@@ -1,0 +1,194 @@
+#!/bin/bash
+# Read-only OCR of the RIGHT WeChat thread pane.
+# List preview is never the group record. This helper only sees the thread crop.
+# Never types or replies in any group (including 独立产品创业联盟3群).
+#
+# Usage:
+#   wechat-watch-thread                 # capture DISPLAY :8, crop thread, OCR
+#   wechat-watch-thread --png FILE.png  # OCR this png (full 1280x800 is cropped)
+#   wechat-watch-thread --still         # OCR persist/watch/thread.png
+#   wechat-watch-thread --when ISO8601  # stamp times (naive = UTC)
+set -euo pipefail
+
+DISPLAY_NUM="${DISPLAY:-:8}"
+PERSIST="${WECHAT_PERSIST:-/home/box/.local/share/wechat-persist}"
+STATE_DIR="${WECHAT_WATCH_DIR:-$PERSIST/watch}"
+PERSIST_FFMPEG="$PERSIST/bin/ffmpeg"
+export TESSDATA_PREFIX="${TESSDATA_PREFIX:-$PERSIST/tessdata}"
+
+# Right conversation pane on 1280x800 WeChat 4.1.
+# Must stay above the blinking cursor / dock. Never the left list.
+THREAD_W=720
+THREAD_H=660
+THREAD_X=414
+THREAD_Y=40
+FULL_W=1280
+FULL_H=800
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REGIONS_PY=""
+for cand in \
+  "/home/box/wechat-watch/wechat-watch-regions" \
+  "$HERE/wechat-watch-regions" \
+  "$PERSIST/wechat-watch-regions"
+do
+  if [ -f "$cand" ]; then
+    REGIONS_PY="$cand"
+    break
+  fi
+done
+GC_SH=""
+for cand in \
+  "/home/box/wechat-watch/wechat-watch-gc" \
+  "$HERE/wechat-watch-gc" \
+  "$PERSIST/wechat-watch-gc"
+do
+  if [ -x "$cand" ]; then
+    GC_SH="$cand"
+    break
+  fi
+done
+
+PNG=""
+MODE="grab"
+WHEN=""
+JSON=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --png)
+      PNG="${2:-}"
+      MODE="png"
+      shift 2
+      ;;
+    --still)
+      MODE="still"
+      shift
+      ;;
+    --when)
+      WHEN="${2:-}"
+      shift 2
+      ;;
+    --json)
+      JSON="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      sed -n '2,14p' "$0"
+      exit 0
+      ;;
+    *)
+      echo "ERROR: unknown arg: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ -z "$REGIONS_PY" ]; then
+  echo "ERROR: wechat-watch-regions not found" >&2
+  exit 1
+fi
+
+find_ffmpeg() {
+  if [ -x "$PERSIST_FFMPEG" ]; then
+    printf '%s\n' "$PERSIST_FFMPEG"
+    return 0
+  fi
+  if command -v ffmpeg >/dev/null 2>&1; then
+    command -v ffmpeg
+    return 0
+  fi
+  return 1
+}
+
+FFMPEG=""
+if ! FFMPEG=$(find_ffmpeg); then
+  echo "ERROR: ffmpeg missing" >&2
+  exit 1
+fi
+
+run_gc() {
+  if [ -n "${GC_SH}" ]; then
+    WECHAT_WATCH_DIR="$STATE_DIR" "$GC_SH" >/dev/null 2>&1 || true
+  fi
+}
+
+mkdir -p "$STATE_DIR"
+# Dedicated still; do not clobber thread.png / thread.prev.png used by scroll detect.
+THREAD_READ="$STATE_DIR/thread-read.png"
+if [ -z "$JSON" ]; then
+  JSON="$STATE_DIR/thread-read.json"
+fi
+
+png_wh() {
+  python3 -c 'import struct,sys;p=sys.argv[1];f=open(p,"rb");
+assert f.read(8)==b"\x89PNG\r\n\x1a\n";f.read(4);assert f.read(4)==b"IHDR";
+w,h=struct.unpack(">II",f.read(8));print(w,h)' "$1"
+}
+
+ensure_thread_crop() {
+  local src="$1"
+  local dest="$2"
+  local wh w h
+  wh="$(png_wh "$src")"
+  w="${wh%% *}"
+  h="${wh##* }"
+  if [ "$w" = "$THREAD_W" ] && [ "$h" = "$THREAD_H" ]; then
+    if [ "$src" != "$dest" ]; then
+      cp -f "$src" "$dest"
+    fi
+    return 0
+  fi
+  "$FFMPEG" -hide_banner -loglevel error -y \
+    -i "$src" \
+    -filter:v "crop=${THREAD_W}:${THREAD_H}:${THREAD_X}:${THREAD_Y}" \
+    "$dest"
+}
+
+SRC=""
+case "$MODE" in
+  still)
+    if [ ! -f "$STATE_DIR/thread.png" ]; then
+      echo "ERROR: $STATE_DIR/thread.png missing (run wechat-watch-diff first, or pass --png)" >&2
+      exit 2
+    fi
+    SRC="$STATE_DIR/thread.png"
+    ensure_thread_crop "$SRC" "$THREAD_READ"
+    ;;
+  png)
+    if [ -z "$PNG" ] || [ ! -f "$PNG" ]; then
+      echo "ERROR: --png file missing: ${PNG:-}" >&2
+      exit 2
+    fi
+    ensure_thread_crop "$PNG" "$THREAD_READ"
+    ;;
+  grab)
+    FULL="$STATE_DIR/thread-read-full.png"
+    "$FFMPEG" -hide_banner -loglevel error -y \
+      -f x11grab -draw_mouse 0 -video_size "${FULL_W}x${FULL_H}" -i "${DISPLAY_NUM}.0" \
+      -frames:v 1 -update 1 "$FULL"
+    ensure_thread_crop "$FULL" "$THREAD_READ"
+    rm -f "$FULL"
+    ;;
+  *)
+    echo "ERROR: bad mode" >&2
+    exit 2
+    ;;
+esac
+
+echo "never_send=1"
+echo "list_is_signal_only=1"
+echo "summaries_repo=wechat-group-summaries"
+echo "display=${DISPLAY_NUM}"
+echo "thread=$THREAD_READ"
+
+TIME_ARGS=()
+if [ -n "$WHEN" ]; then
+  TIME_ARGS+=(--when "$WHEN")
+fi
+
+WECHAT_FFMPEG="$FFMPEG" python3 "$REGIONS_PY" \
+  --ocr-still "$THREAD_READ" \
+  --json "$JSON" \
+  "${TIME_ARGS[@]}"
+
+run_gc

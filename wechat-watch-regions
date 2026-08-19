@@ -19,6 +19,8 @@ Usage:
   wechat-watch-regions --detect-scroll --prev thread.prev.png --curr thread.png
   wechat-watch-regions --parse-frames FRAMES_DIR --timeline OUT.json \\
       --identities identities.json --avatars-dir avatars/
+  wechat-watch-regions --format-time [--when ISO8601]
+  wechat-watch-regions --ocr-still THREAD.png [--json OUT.json] [--when ISO8601]
 """
 from __future__ import annotations
 
@@ -29,6 +31,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 THRESH = 12
 MERGE_GAP = 16
@@ -57,6 +61,11 @@ SCROLL_AREA_MIN = 0.12
 SCROLL_ROW_VAR_MIN = 80.0
 THUMB_MOVE_MIN = 4.0
 IDENTITIES_VERSION = 1
+
+# 1280x800 WeChat 4.1 geometry (w, h, x, y). List hash + thread scroll use these.
+LIST_CROP = (440, 700, 70, 30)
+THREAD_CROP = (720, 660, 414, 40)
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 # CJK Unified Ideographs + common extensions / compatibility (not punctuation).
 _CJK_RANGES = (
@@ -1114,6 +1123,64 @@ def annotate_full(
     return recs
 
 
+def shanghai_tz():
+    """Asia/Shanghai (UTC+8, no DST). Used when labelling summary times."""
+    return SHANGHAI_TZ
+
+
+def parse_when(s: str | None) -> datetime:
+    """Parse an ISO8601 instant. Naive values are treated as UTC (desktop clock)."""
+    if not s:
+        return datetime.now(timezone.utc)
+    raw = s.strip().replace("Z", "+00:00")
+    dt = datetime.fromisoformat(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def format_summary_times(when: datetime | None = None) -> dict[str, str]:
+    """Dual labels: WeChat on the cloud desktop is UTC; summaries also use Asia/Shanghai."""
+    if when is None:
+        when = datetime.now(timezone.utc)
+    elif when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    utc = when.astimezone(timezone.utc)
+    shanghai = when.astimezone(SHANGHAI_TZ)
+    return {
+        "utc": utc.isoformat(timespec="seconds"),
+        "shanghai": shanghai.isoformat(timespec="seconds"),
+        "utc_label": "UTC",
+        "shanghai_label": "Asia/Shanghai",
+    }
+
+
+def emit_summary_times(when: datetime | None = None) -> None:
+    times = format_summary_times(when)
+    print(f"at_utc={times['utc']}")
+    print(f"at_shanghai={times['shanghai']}")
+    print("tz_note=WeChat desktop is UTC; summaries also label Asia/Shanghai")
+
+
+def ocr_thread_still(
+    path: str,
+    json_path: str | None = None,
+    when: datetime | None = None,
+) -> list[dict]:
+    """OCR one already-cropped thread pane. Never the left list. Never sends."""
+    emit_summary_times(when)
+    tw, th, tx, ty = THREAD_CROP
+    print("source=thread")
+    print(f"crop={tw}x{th}+{tx}+{ty}")
+    print("list_is_signal_only=1")
+    print("never_send=1")
+    if not json_path:
+        json_path = os.path.splitext(path)[0] + ".json"
+    recs = annotate_full(path, json_path, emit_side=True)
+    emit_region_stdout(recs, label="thread_", emit_side=True)
+    return recs
+
+
 def default_ffmpeg() -> str:
     return os.environ.get(
         "WECHAT_FFMPEG",
@@ -1197,7 +1264,31 @@ def main() -> int:
         default=4.0,
         help="frame rate used to compute timeline t (seconds)",
     )
+    p.add_argument(
+        "--format-time",
+        action="store_true",
+        help="print at_utc= and at_shanghai= (desktop is UTC; also label Asia/Shanghai)",
+    )
+    p.add_argument(
+        "--when",
+        help="ISO8601 instant for --format-time / --ocr-still (naive = UTC)",
+    )
+    p.add_argument(
+        "--ocr-still",
+        help="OCR one thread-pane PNG and print text for wechat-group-summaries",
+    )
     args = p.parse_args()
+
+    if args.format_time:
+        emit_summary_times(parse_when(args.when))
+        return 0
+
+    if args.ocr_still:
+        if not os.path.isfile(args.ocr_still):
+            print(f"ERROR: thread png missing: {args.ocr_still}", file=sys.stderr)
+            return 2
+        ocr_thread_still(args.ocr_still, json_path=args.json, when=parse_when(args.when))
+        return 0
 
     if args.should_record:
         rec = should_record_scroll(bool(args.list_changed), bool(args.scrolling))
@@ -1263,7 +1354,7 @@ def main() -> int:
         return 0
 
     if not args.prev or not args.curr:
-        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record")
+        p.error("--prev and --curr are required unless --full / --detect-scroll / --parse-frames / --should-record / --format-time / --ocr-still")
     if not args.out_dir or not args.json:
         p.error("--out-dir and --json are required unless --detect-scroll / --parse-frames / --should-record")
 

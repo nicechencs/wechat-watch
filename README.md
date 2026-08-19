@@ -110,7 +110,7 @@ $WECHAT_PERSIST/tessdata/eng.traineddata
 
 ```bash
 PERSIST="${WECHAT_PERSIST:-$HOME/.local/share/wechat-persist}"
-sudo cp wechat-watch-diff wechat-watch-regions wechat-watch-gc "$PERSIST/"
+sudo cp wechat-watch-diff wechat-watch-regions wechat-watch-gc wechat-watch-thread "$PERSIST/"
 sudo cp wechat-watch-diff /home/box/.local/bin/wechat-watch-diff
 sudo chmod 0755 /home/box/.local/bin/wechat-watch-diff "$PERSIST/wechat-watch-gc"
 ```
@@ -167,6 +167,10 @@ kind1=image
 ./wechat-watch-regions --prev thread.prev.png --curr thread.png \
   --out-dir ./thread-out --json ./thread-out/thread-regions.json \
   --prefix t --label thread_ --emit-side --extra-top-pad 22
+
+# 当前右侧对话区只读 OCR（给 wechat-group-summaries，不发送）
+./wechat-watch-thread
+./wechat-watch-regions --format-time --when 2026-08-19T07:02:00+00:00
 ```
 
 ## 区域差分规则
@@ -195,7 +199,7 @@ kind1=image
 python3 tests/test_regions.py
 ```
 
-当前覆盖：假色块切框、徽章保留、大面积变化回退、中英 OCR、CLI 的 `textN=` / `kindN=`、thread 尺寸切框、左右气泡 → `in`/`out`、滚动检测、列表变化不录像、头像 average-hash、identities 绑定、时间线 JSON、`wechat-watch-gc` 过期删除。
+当前覆盖：假色块切框、徽章保留、大面积变化回退、中英 OCR、CLI 的 `textN=` / `kindN=`、thread 尺寸切框、左右气泡 → `in`/`out`、滚动检测、列表变化不录像、头像 average-hash、identities 绑定、时间线 JSON、`wechat-watch-gc` 过期删除、UTC/Asia/Shanghai 双时区、`wechat-watch-thread --png` 只读 OCR。
 
 ## 运行时文件（不进 git）
 
@@ -226,13 +230,17 @@ wechat-watch/
 ├── LICENSE                 MIT
 ├── README.md               本文件
 ├── CONTRIBUTING.md         贡献说明
+├── docs/group-handling.md  群聊处理办法（信号 / 右侧翻历史 / 不发言 / 摘要仓库）
 ├── wechat-watch-diff       Bash 入口：列表哈希、滚动才录像、GC
-├── wechat-watch-regions    Python：差分切框 + OCR + 滚动检测 + 时间线
+├── wechat-watch-regions    Python：差分切框 + OCR + 滚动检测 + 时间线 + 双时区
+├── wechat-watch-thread     只读：裁右侧对话区并 OCR，打印文本给 summaries
 ├── wechat-watch-gc         过期删除录像/截图，只留识别结果
 └── tests/test_regions.py   单元测试
 ```
 
 ## 群聊 / 右侧对话区
+
+群聊处理办法（列表只当信号、必须点进右侧翻历史、禁止在任何群发言、摘要写到私有仓库、时间同时标 UTC 与 Asia/Shanghai）见 **[docs/group-handling.md](docs/group-handling.md)**。只读助手：`./wechat-watch-thread` 裁当前右侧对话区并 OCR，供写入 [wechat-group-summaries](https://github.com/nicechencs/wechat-group-summaries)。**不要**把私聊 / 群记录提交进本仓库。
 
 左侧会话列表每一行预览都很短，群聊里「谁说了什么」单靠列表看不清。翻历史时以右侧对话区为准：
 
