@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -2869,6 +2872,226 @@ class SendHelperTests(unittest.TestCase):
         self.assertIn("type", ops)
         self.assertIn("submit", ops)
 
+        result = regions.run_send(
+            "阿坤",
+            "好",
+            sessions=[{"name": "阿坤", "row": 1}],
+            dry_run=True,
+            probe_window=False,
+            already_open=True,
+        )
+        self.assertTrue(result["ok"])
+        run_ops = [a["op"] for a in result["plan"]["actions"]]
+        self.assertNotIn("focus-session", run_ops)
+        self.assertEqual(run_ops[0], "focus-input")
+
+    def test_two_chen_username_disambiguates(self):
+        sessions = [
+            {"name": "陈", "username": "wxid_chen_a"},
+            {"name": "陈", "username": "wxid_chen_b"},
+        ]
+        with self.assertRaises(regions.SendRefused) as ctx:
+            regions.match_peer("陈", sessions)
+        self.assertEqual(ctx.exception.error, "ambiguous-peer")
+        hit = regions.match_peer("陈", sessions, username="wxid_chen_a")
+        self.assertEqual(hit["name"], "陈")
+        self.assertEqual(hit.get("username"), "wxid_chen_a")
+        hit = regions.match_peer("", sessions, username="wxid_chen_b")
+        self.assertEqual(hit["name"], "陈")
+        self.assertEqual(hit.get("username"), "wxid_chen_b")
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "sessions.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "ok": True,
+                        "command": "chat.sessions",
+                        "sessions": [
+                            {
+                                "username": "wxid_chen_a",
+                                "display": "陈",
+                                "kind": "private",
+                            },
+                            {
+                                "username": "wxid_chen_b",
+                                "display": "陈",
+                                "kind": "private",
+                            },
+                        ],
+                    },
+                    fh,
+                    ensure_ascii=False,
+                )
+            proc = self._cli(
+                [
+                    "send",
+                    "--peer",
+                    "陈",
+                    "--username",
+                    "wxid_chen_b",
+                    "--text",
+                    "好",
+                    "--dry-run",
+                    "--sessions-json",
+                    path,
+                ]
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            rec = self._last_json(proc.stdout)
+            self.assertTrue(rec["ok"])
+            self.assertEqual(rec["peer"], "陈")
+            self.assertEqual(rec["text"], "好")
+
+    def test_cli_username_without_sessions_json_uses_wxcli(self):
+        payload = {
+            "ok": True,
+            "command": "chat.sessions",
+            "sessions": [
+                {
+                    "username": "wxid_0svgaau5drvs12",
+                    "display": "阿坤",
+                    "kind": "private",
+                },
+                {
+                    "username": "50240319502@chatroom",
+                    "display": "独立产品创业联盟3群",
+                    "kind": "group",
+                },
+                {
+                    "username": "filehelper",
+                    "display": "文件传输助手",
+                    "kind": "system",
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as td:
+            stub = os.path.join(td, "wx-cli")
+            with open(stub, "w", encoding="utf-8") as fh:
+                fh.write("#!/usr/bin/env python3\n")
+                fh.write("import json\n")
+                fh.write("print(json.dumps(")
+                fh.write(repr(payload))
+                fh.write(", ensure_ascii=False))\n")
+            os.chmod(stub, 0o755)
+            env = os.environ.copy()
+            env["WX_CLI"] = stub
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "send",
+                    "--username",
+                    "wxid_0svgaau5drvs12",
+                    "--text",
+                    "好",
+                    "--dry-run",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            rec = self._last_json(proc.stdout)
+            self.assertTrue(rec["ok"])
+            self.assertEqual(rec["peer"], "阿坤")
+            self.assertEqual(rec["text"], "好")
+            self.assertNotIn("error", rec)
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "send",
+                    "--peer",
+                    "阿坤",
+                    "--text",
+                    "好",
+                    "--already-open",
+                    "--dry-run",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            rec = self._last_json(proc.stdout)
+            self.assertTrue(rec["ok"])
+            self.assertEqual(rec["peer"], "阿坤")
+
+    def test_apply_send_plan_uses_x11_not_atspi(self):
+        import wechat_watch_apply as apply_mod
+
+        src = inspect.getsource(apply_mod.apply_send_plan)
+        self.assertNotIn("Atspi", src)
+        self.assertNotIn("gi.repository", src)
+        self.assertNotIn("generate_mouse_event", src)
+        self.assertNotIn("get_desktop", src)
+
+        class FakeX11:
+            def __init__(self):
+                self.calls = []
+
+            def click(self, x, y):
+                self.calls.append(("click", int(x), int(y)))
+
+            def paste(self, text):
+                self.calls.append(("paste", text))
+
+            def submit(self):
+                self.calls.append(("submit",))
+
+        class AbortAtspi(types.ModuleType):
+            def __getattr__(self, name):
+                os.kill(os.getpid(), signal.SIGTRAP)
+
+            def generate_mouse_event(self, *a, **k):
+                os.kill(os.getpid(), signal.SIGTRAP)
+
+            def get_desktop(self, *a, **k):
+                os.kill(os.getpid(), signal.SIGTRAP)
+
+        plan = {
+            "peer": "阿坤",
+            "text": "你好",
+            "actions": [
+                {"op": "focus-session", "x": 80, "y": 120},
+                {"op": "focus-input", "x": 500, "y": 760},
+                {"op": "type", "text": "你好"},
+                {"op": "submit"},
+            ],
+        }
+        fake = FakeX11()
+        planted = {
+            "gi": AbortAtspi("gi"),
+            "gi.repository": AbortAtspi("gi.repository"),
+            "gi.repository.Atspi": AbortAtspi("gi.repository.Atspi"),
+        }
+        with patch.dict(sys.modules, planted):
+            ok = apply_mod.apply_send_plan(plan, x11=fake)
+        self.assertTrue(ok)
+        self.assertEqual(
+            fake.calls,
+            [
+                ("click", 80, 120),
+                ("click", 500, 760),
+                ("paste", "你好"),
+                ("submit",),
+            ],
+        )
+
+        boom = apply_mod.X11SendDriver
+
+        def abort_default():
+            os.kill(os.getpid(), signal.SIGTRAP)
+            return boom()
+
+        with patch.object(apply_mod, "X11SendDriver", side_effect=abort_default):
+            fake2 = FakeX11()
+            ok = apply_mod.apply_send_plan(plan, x11=fake2)
+            self.assertTrue(ok)
+            self.assertEqual(fake2.calls[-1], ("submit",))
+
     def test_geom_fail_falls_back_to_private_apply(self):
         with patch("wechat_watch_apply.apply_send_plan") as geom, patch(
             "wechat_watch_apply.apply_private_text"
@@ -2887,9 +3110,9 @@ class SendHelperTests(unittest.TestCase):
             apply.assert_called_once_with("阿坤", "好")
 
     def test_apply_source_submits_after_fill(self):
-        path = os.path.join(ROOT, "wechat_watch_apply.py")
-        with open(path, encoding="utf-8") as fh:
-            src = fh.read()
+        import wechat_watch_apply as apply_mod
+
+        src = inspect.getsource(apply_mod.apply_private_text)
         self.assertIn("set_text_contents", src)
         self.assertIn("print(\"OK\")", src)
         has_return = "0xFF0D" in src or "Return" in src or "generate_keyboard_event" in src

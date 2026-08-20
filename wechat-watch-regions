@@ -35,8 +35,9 @@ Usage:
   wechat-watch-regions --normalize-nick RAW
       # print nick= and ok=0|1; no PNG
   wechat-watch-regions --send --peer PEER --text TEXT [--username USER]
-      [--dry-run] [--sessions-json FILE]
+      [--dry-run] [--sessions-json FILE] [--already-open]
       # 1:1 only; refuse groups / empty text / File Transfer / Weixin Team
+      # --username alone is enough when unique; no --sessions-json loads wx-cli
       # also: wechat-watch-regions send --peer PEER --text TEXT
 """
 from __future__ import annotations
@@ -3822,14 +3823,53 @@ def sessions_from_atspi(
     return sessions_from_row_recs(out)
 
 
-def load_sessions_json(path: str) -> list:
-    with open(path, encoding="utf-8") as fh:
-        data = json.load(fh)
+def parse_sessions_payload(data) -> list:
+    """wx-cli / injected JSON: list or {sessions: [...]} with display names."""
     if isinstance(data, dict):
         data = data.get("sessions") or data.get("peers") or []
     if not isinstance(data, list):
         raise SendRefused("bad-sessions", peer="", text="")
     return sessions_from_row_recs(data)
+
+
+def load_sessions_json(path: str) -> list:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    return parse_sessions_payload(data)
+
+
+_DEFAULT_WX_CLI = "/home/box/wx-linux-read/wx-cli"
+
+
+def load_sessions_wxcli(cli: str | None = None) -> list:
+    """`wx-cli chat sessions --limit 50 --json` (or $WX_CLI). Never OCR."""
+    path = (cli if cli is not None else os.environ.get("WX_CLI") or _DEFAULT_WX_CLI).strip()
+    if not path or not os.path.isfile(path):
+        return []
+    cmd = [path, "chat", "sessions", "--limit", "50", "--json"]
+    if not os.access(path, os.X_OK):
+        cmd = [sys.executable, *cmd]
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    raw = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    try:
+        return parse_sessions_payload(data)
+    except SendRefused:
+        return []
 
 
 def plan_private_send(
@@ -4005,13 +4045,8 @@ def run_send(
     sess: list = list(sessions) if sessions is not None else []
     if sessions is None and (atspi_tree is not None or atspi_extents is not None):
         sess = sessions_from_atspi(tree=atspi_tree, extents=atspi_extents)
-    elif sessions is None and not dry_run:
-        png = os.path.join(default_persist(), "watch", "list.png")
-        if os.path.isfile(png):
-            try:
-                sess = sessions_from_list_png(png, resolve_ffmpeg(default_ffmpeg()))
-            except (OSError, ValueError, subprocess.CalledProcessError):
-                sess = []
+    elif sessions is None:
+        sess = load_sessions_wxcli()
     if sessions is not None or sess:
         plan = plan_private_send(
             peer=checked['peer'],
@@ -4085,6 +4120,7 @@ def cli_send(args) -> int:
             sessions=sessions,
             dry_run=dry,
             probe_window=False,
+            already_open=bool(getattr(args, "already_open", False)),
         )
     except SendRefused as exc:
         emit_send_result(
@@ -4259,6 +4295,11 @@ def main() -> int:
     p.add_argument(
         "--sessions-json",
         help="with --send: injected session list (tests / no GUI)",
+    )
+    p.add_argument(
+        "--already-open",
+        action="store_true",
+        help="with --send: skip clicking the session list (composer already open)",
     )
     args = p.parse_args(rewrite_send_argv(sys.argv)[1:])
 

@@ -126,7 +126,10 @@ export DISPLAY="${DISPLAY:-:8}"
 ./wechat-watch-diff
 
 # 已登录窗口里给已有私聊发一条短文本（不要对群用）
+# 实况点按走 X11，不在本进程调 AT-SPI（无障碍总线缺失时 Atspi 会 SIGTRAP 整进程）
+# 省略 --sessions-json 时读 wx-cli chat sessions（或 $WX_CLI），不要 OCR 过期 list.png
 ./wechat-watch-regions --send --peer '阿坤' --text '好'
+./wechat-watch-regions send --username wxid_xxx --text '好' --already-open
 ```
 
 ### 没有变化
@@ -200,8 +203,10 @@ unread0=5
 ./wechat-watch-regions --normalize-nick "陈"
 
 # 已有 1:1 会话发一条短文本（群 / 文件传输助手 / Weixin Team 拒绝）
+# --username 在唯一时可单独用；--already-open 不再点列表；中文走剪贴板+Ctrl+V
 ./wechat-watch-regions --send --peer '阿坤' --text '好'
 ./wechat-watch-regions send --peer '阿坤' --text '好'
+./wechat-watch-regions send --username wxid_xxx --text '好' --already-open
 
 # 当前微信窗口矩形 + nav/list/thread 裁剪（找不到则 1280x800 常量）
 ./wechat-watch-regions --window-geom
@@ -309,7 +314,7 @@ wechat-watch/
 ├── wechat-watch.py         薄入口：`python3 wechat-watch.py send --peer … --text …`
 ├── wechat-watch-diff       Bash 入口：列表哈希、滚动才录像、GC
 ├── wechat-watch-regions    Python：差分切框 + OCR + 滚动检测 + 时间线 + 双时区 + 未读标记 + 1:1 --send
-├── wechat_watch_apply.py   --send 实况：已有窗口上 AT-SPI 填字并提交（测试不走这里）
+├── wechat_watch_apply.py   --send 实况：X11 点按/粘贴/回车（AT-SPI 只在可死子进程）
 ├── wechat-watch-thread     只读：裁右侧对话区并 OCR，打印文本给 summaries
 ├── wechat-watch-gc         过期删除录像/截图，只留识别结果
 └── tests/test_regions.py   单元测试（含 1:1 send 拒群 / 拒空 / 匹配）
