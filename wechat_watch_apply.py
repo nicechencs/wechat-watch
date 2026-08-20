@@ -17,6 +17,8 @@ def apply_send_plan(plan: dict, x11=None) -> bool:
 
     Never talks to AT-SPI in this process. A missing accessibility bus
     aborts the interpreter (SIGTRAP); clicks go through X11 instead.
+    ok is False unless a required session-row click actually ran and the
+    optional selected-session check still matches the peer.
     """
     if not isinstance(plan, dict):
         return False
@@ -36,15 +38,26 @@ def apply_send_plan(plan: dict, x11=None) -> bool:
     driver = x11 if x11 is not None else X11SendDriver()
     typed = False
     submitted = False
+    need_session = any((s.get("op") == "focus-session") for s in actions)
+    clicked_session = False
     try:
         wid = plan.get("window_id") or plan.get("id")
         driver.raise_window(None if not wid else str(wid))
+        waiter = getattr(driver, "wait_active", None)
+        if callable(waiter):
+            waiter(None if not wid else str(wid))
         time.sleep(_RAISE_SLEEP_S)
         for step in actions:
             op = step.get("op")
             if op == "focus-session":
                 driver.click(int(step["x"]), int(step["y"]))
+                clicked_session = True
+                switched = getattr(driver, "wait_session", None)
+                if callable(switched):
+                    switched(peer)
                 time.sleep(_FOCUS_SESSION_SLEEP_S)
+                if not _selected_matches_plan(driver, plan):
+                    return False
             elif op == "focus-input":
                 driver.click(int(step["x"]), int(step["y"]))
                 time.sleep(_FOCUS_INPUT_SLEEP_S)
@@ -57,7 +70,56 @@ def apply_send_plan(plan: dict, x11=None) -> bool:
                 submitted = True
     except Exception:
         return False
+    if need_session and not clicked_session:
+        return False
+    if not _selected_matches_plan(driver, plan):
+        return False
     return bool(typed and submitted)
+
+
+def _fold_verify(text: str) -> str:
+    raw = (text or "").replace("\n", " ").replace("\r", " ")
+    raw = raw.replace("…", "").replace("...", "")
+    return "".join(raw.split()).lower()
+
+
+def _selected_matches_plan(driver, plan: dict) -> bool:
+    """Fail send if the driver still shows a different session after the click."""
+    fn = getattr(driver, "selected_session", None)
+    if not callable(fn):
+        return True
+    try:
+        got = fn()
+    except Exception:
+        return True
+    if not got:
+        return True
+    peer = str(plan.get("peer") or "")
+    sess = plan.get("session") if isinstance(plan.get("session"), dict) else {}
+    want_u = str(plan.get("username") or (sess or {}).get("username") or "")
+    want_last = str((sess or {}).get("last") or (sess or {}).get("preview") or "")
+    click = plan.get("click") if isinstance(plan.get("click"), dict) else {}
+    if not want_last and click:
+        want_last = str(click.get("last") or click.get("preview") or "")
+    if isinstance(got, str):
+        g = got.strip()
+        if peer and g and g != peer and peer not in g and g not in peer:
+            return False
+        return True
+    if isinstance(got, dict):
+        name = str(got.get("name") or got.get("display") or got.get("title") or "")
+        uname = str(got.get("username") or got.get("user") or got.get("wxid") or "")
+        snippet = str(got.get("last") or got.get("preview") or got.get("snippet") or "")
+        if want_u and uname and want_u.strip().lower() != uname.strip().lower():
+            return False
+        if name and peer and name != peer and peer not in name and name not in peer:
+            return False
+        if want_last and snippet:
+            fa, fb = _fold_verify(want_last), _fold_verify(snippet)
+            if fa and fb and fa != fb and fa not in fb and fb not in fa:
+                return False
+        return True
+    return True
 
 
 def _refused_send_peer(peer: str) -> bool:
@@ -86,8 +148,24 @@ class X11SendDriver:
         """Map-raise and activate WeChat so XTEST keys do not hit another client."""
         wid = (win_id or "").strip() or _find_send_window_id()
         if _xlib_raise(wid) or _ctypes_raise(wid) or _xdotool_raise(wid) or _wmctrl_raise(wid):
+            self.wait_active(wid)
             return
         raise RuntimeError("x11-raise-failed")
+
+    def wait_active(self, win_id: str | None = None) -> None:
+        """Block until _NET_ACTIVE_WINDOW is WeChat (keys must not hit a terminal)."""
+        wid = (win_id or "").strip() or _find_send_window_id()
+        if _wait_active_window(wid):
+            return
+        xid = _parse_xid(wid)
+        cur = _xlib_active_window_xid() or _xdotool_active_window_xid()
+        if xid is not None and cur is not None and int(cur) != xid:
+            raise RuntimeError("x11-raise-failed")
+        time.sleep(_RAISE_SLEEP_S)
+
+    def wait_session(self, peer: str | None = None) -> None:
+        """Give the client time to switch the open thread after a list click."""
+        time.sleep(_FOCUS_SESSION_SLEEP_S)
 
     def click(self, x: int, y: int) -> None:
         if _xlib_click(x, y):
@@ -443,6 +521,77 @@ def _xlib_raise(win_id: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _xlib_active_window_xid() -> int | None:
+    """EWMH _NET_ACTIVE_WINDOW on the root. None if the property is missing."""
+    mods = _xlib_mods()
+    if mods is None:
+        return None
+    X, display, _xtest = mods
+    try:
+        dpy = display.Display()
+        root = dpy.screen().root
+        atom = dpy.intern_atom("_NET_ACTIVE_WINDOW")
+        prop = root.get_full_property(atom, X.AnyPropertyType)
+        dpy.close()
+        if not prop or not getattr(prop, "value", None):
+            return None
+        return int(prop.value[0])
+    except Exception:
+        return None
+
+
+def _xdotool_active_window_xid() -> int | None:
+    exe = shutil.which("xdotool")
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run(
+            [exe, "getactivewindow"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    tok = (proc.stdout or "").strip().split()
+    if not tok:
+        return None
+    raw = tok[0]
+    try:
+        return int(raw, 16) if raw.lower().startswith("0x") else int(raw)
+    except ValueError:
+        return None
+
+
+def _wait_active_window(win_id: str, timeout: float = 1.0) -> bool:
+    """True if the WM reports our xid as _NET_ACTIVE_WINDOW before timeout.
+
+    Unknown (no property / no xdotool) is not a hard fail: some WMs omit it.
+    A *different* active window means keys would hit the covering client.
+    """
+    xid = _parse_xid(win_id)
+    if xid is None:
+        return False
+    deadline = time.time() + max(0.05, float(timeout))
+    seen = False
+    last = None
+    while time.time() < deadline:
+        last = _xlib_active_window_xid()
+        if last is None:
+            last = _xdotool_active_window_xid()
+        if last is None:
+            time.sleep(0.05)
+            continue
+        seen = True
+        if int(last) == xid:
+            return True
+        time.sleep(0.05)
+    if not seen:
+        return False
+    return last is not None and int(last) == xid
 
 
 def _ctypes_raise(win_id: str) -> bool:

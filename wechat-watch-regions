@@ -3796,10 +3796,46 @@ def _has_click_geom(rec: dict) -> bool:
     return False
 
 
+def _usernames_match(a: str | None, b: str | None) -> bool:
+    sa = ("" if a is None else str(a)).strip().lower()
+    sb = ("" if b is None else str(b)).strip().lower()
+    return bool(sa) and sa == sb
+
+
+def already_open_skips_click(
+    already_open: bool,
+    chosen: dict | None,
+    open_username: str | None = None,
+    open_name: str | None = None,
+) -> bool:
+    """True only when the open thread is already this peer.
+
+    `--already-open` is trusted when the open thread is unknown. If the
+    open username is known, skip the list click only for that username.
+    A header display name is not enough when the chosen row has a wxid
+    (two 陈s).
+    """
+    if not already_open or not isinstance(chosen, dict):
+        return False
+    want_u = _session_username(chosen)
+    open_u = ("" if open_username is None else str(open_username)).strip()
+    if open_u:
+        return _usernames_match(open_u, want_u)
+    open_n = ("" if open_name is None else str(open_name)).strip()
+    if open_n:
+        if not _display_names_match(open_n, _session_name(chosen)):
+            return False
+        if want_u:
+            return False
+        return True
+    return True
+
+
 def locate_visible_list_row(
     chosen: dict,
     rows: list | None,
     peer: str = "",
+    require_click_geom: bool = False,
 ) -> dict:
     """On-screen left-list row for a matched session.
 
@@ -3819,18 +3855,27 @@ def locate_visible_list_row(
         if isinstance(rec, dict):
             pool.append(rec)
     named = [r for r in pool if _display_names_match(_session_name(r), want_name)]
-    if len(named) == 0:
-        return chosen
-    if len(named) == 1:
-        return named[0]
     want_last = _session_last(chosen)
+    if len(named) == 0:
+        raise SendRefused("peer-not-found", peer=label, text="")
+    if len(named) == 1:
+        hit = named[0]
+        got_last = _session_last(hit)
+        if want_last and got_last and not snippets_match(got_last, want_last):
+            raise SendRefused("peer-not-found", peer=label, text="")
+        if require_click_geom and not _has_click_geom(hit):
+            raise SendRefused("peer-not-found", peer=label, text="")
+        return hit
     if want_last:
         snipped = [r for r in named if snippets_match(_session_last(r), want_last)]
         if len(snipped) == 1:
             hit = snipped[0]
-            if _has_click_geom(hit):
-                return hit
+            if not _has_click_geom(hit):
+                raise SendRefused("ambiguous-peer", peer=label, text="")
+            return hit
+        if len(snipped) > 1:
             raise SendRefused("ambiguous-peer", peer=label, text="")
+        raise SendRefused("peer-not-found", peer=label, text="")
     raise SendRefused("ambiguous-peer", peer=label, text="")
 
 
@@ -4016,6 +4061,9 @@ def plan_private_send(
     crops: dict | None = None,
     already_open: bool = False,
     visible_rows: list | None = None,
+    require_click_geom: bool = False,
+    open_username: str | None = None,
+    open_name: str | None = None,
 ) -> dict:
     """Pure plan: validate, match existing 1:1, locate input. No desktop I/O."""
     checked = validate_send(peer, text, username=username)
@@ -4034,15 +4082,31 @@ def plan_private_send(
     pane = crops or window_crops(*win_box)
     inp = input_box_point(win_box, pane)
     actions: list[dict] = []
-    if chosen is not None and not already_open:
+    click_rec = None
+    skip_list = already_open_skips_click(
+        already_open,
+        chosen,
+        open_username=open_username,
+        open_name=open_name,
+    )
+    if chosen is not None and not skip_list:
         rows = visible_rows if visible_rows is not None else sessions
         click_rec = locate_visible_list_row(
             chosen,
             rows,
             peer=checked["peer"] or peer,
+            require_click_geom=require_click_geom,
         )
         row_pt = list_row_point(pane["list"], click_rec)
-        actions.append({"op": "focus-session", "x": row_pt[0], "y": row_pt[1]})
+        actions.append(
+            {
+                "op": "focus-session",
+                "x": row_pt[0],
+                "y": row_pt[1],
+                "name": _session_name(click_rec) or checked["peer"],
+                "last": _session_last(click_rec) or _session_last(chosen),
+            }
+        )
     actions.append({"op": "focus-input", "x": inp[0], "y": inp[1]})
     actions.append({"op": "type", "text": checked["text"]})
     actions.append({"op": "submit"})
@@ -4054,6 +4118,7 @@ def plan_private_send(
         "text": checked["text"],
         "username": checked["username"],
         "session": chosen,
+        "click": click_rec,
         "input": inp,
         "actions": actions,
     }
@@ -4152,9 +4217,11 @@ def sessions_from_list_png(path: str, ffmpeg: str) -> list[dict]:
             name = parse_row_title(raw)
             if not name:
                 continue
+            if name.lower() in ("search", "wechat", "weixin") or name in ("搜索", "微信"):
+                continue
             item = {
                 "name": name,
-                "row": i,
+                "row": len(out),
                 "x": cx + nx,
                 "y": cy + y,
                 "w": nw,
@@ -4181,6 +4248,8 @@ def run_send(
     probe_window: bool = False,
     already_open: bool = False,
     visible_rows: list | None = None,
+    open_username: str | None = None,
+    open_name: str | None = None,
 ) -> dict:
     checked = validate_send(peer, text, username=username)
     win, source = find_window(
@@ -4192,45 +4261,52 @@ def run_send(
         sess = sessions_from_atspi(tree=atspi_tree, extents=atspi_extents)
     elif sessions is None:
         sess = load_sessions_wxcli()
+    live_click = not dry_run and not already_open_skips_click(
+        already_open,
+        {"name": checked["peer"], "username": checked["username"] or (username or "")},
+        open_username=open_username,
+        open_name=open_name,
+    )
+    plan_kw = dict(
+        peer=checked["peer"],
+        text=checked["text"],
+        username=checked["username"] or username,
+        win=win,
+        crops=pane,
+        already_open=already_open,
+        visible_rows=visible_rows,
+        require_click_geom=live_click,
+        open_username=open_username,
+        open_name=open_name,
+    )
     if sessions is not None or sess:
-        plan = plan_private_send(
-            peer=checked['peer'],
-            text=checked['text'],
-            username=checked['username'] or username,
-            sessions=sess,
-            win=win,
-            crops=pane,
-            already_open=already_open,
-            visible_rows=visible_rows,
-        )
+        plan = plan_private_send(sessions=sess, **plan_kw)
     else:
         if not dry_run:
-            raise SendRefused('peer-not-found', peer=checked['peer'], text=checked['text'])
-        plan = plan_private_send(
-            peer=checked['peer'],
-            text=checked['text'],
-            username=checked['username'],
-            sessions=None,
-            win=win,
-            crops=pane,
-            already_open=already_open,
-            visible_rows=visible_rows,
-        )
+            raise SendRefused("peer-not-found", peer=checked["peer"], text=checked["text"])
+        plan = plan_private_send(sessions=None, **plan_kw)
     if dry_run:
         return {
-            'ok': True,
-            'peer': plan['peer'],
-            'text': plan['text'],
-            'dry_run': True,
-            'plan': plan,
-            'source': source,
+            "ok": True,
+            "peer": plan["peer"],
+            "text": plan["text"],
+            "dry_run": True,
+            "plan": plan,
+            "source": source,
         }
+    need_session = any(
+        (step.get("op") == "focus-session") for step in (plan.get("actions") or [])
+    )
     wid = find_window_id(env=env, tree_text=tree_text, probe=probe_window)
     if wid:
-        plan['window_id'] = wid
+        plan["window_id"] = wid
     if driver is not None:
         execute_send_plan(plan, driver)
-        return {'ok': True, 'peer': plan['peer'], 'text': plan['text']}
+        if need_session and not _driver_clicked_session(driver, plan):
+            raise SendRefused("peer-not-found", peer=plan["peer"], text=plan["text"])
+        if not _selected_matches_plan(driver, plan):
+            raise SendRefused("peer-not-found", peer=plan["peer"], text=plan["text"])
+        return {"ok": True, "peer": plan["peer"], "text": plan["text"]}
     apply_plan = None
     apply = None
     try:
@@ -4243,10 +4319,65 @@ def run_send(
         apply_plan = None
         apply = None
     if apply_plan is not None and apply_plan(plan):
-        return {'ok': True, 'peer': plan['peer'], 'text': plan['text']}
-    if apply is not None and apply(plan['peer'], plan['text']):
-        return {'ok': True, 'peer': plan['peer'], 'text': plan['text']}
-    raise SendRefused('no-input-driver', peer=plan['peer'], text=plan['text'])
+        return {"ok": True, "peer": plan["peer"], "text": plan["text"]}
+    if apply is not None and apply(plan["peer"], plan["text"]):
+        return {"ok": True, "peer": plan["peer"], "text": plan["text"]}
+    raise SendRefused("no-input-driver", peer=plan["peer"], text=plan["text"])
+
+
+def _driver_clicked_session(driver, plan: dict) -> bool:
+    """True if the driver recorded a session click at the planned x/y."""
+    want = None
+    for step in plan.get("actions") or []:
+        if step.get("op") == "focus-session":
+            want = (int(step["x"]), int(step["y"]))
+            break
+    if want is None:
+        return True
+    calls = getattr(driver, "calls", None)
+    if not isinstance(calls, list):
+        return True
+    for rec in calls:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("op") == "focus" and rec.get("kind") == "session":
+            return int(rec.get("x") or 0) == want[0] and int(rec.get("y") or 0) == want[1]
+        if rec.get("op") == "click":
+            return int(rec.get("x") or 0) == want[0] and int(rec.get("y") or 0) == want[1]
+    return False
+
+
+def _selected_matches_plan(driver, plan: dict) -> bool:
+    """Optional cheap verify: driver.selected_session matches the peer."""
+    fn = getattr(driver, "selected_session", None)
+    if not callable(fn):
+        return True
+    try:
+        got = fn()
+    except Exception:
+        return True
+    if not got:
+        return True
+    peer = str(plan.get("peer") or "")
+    sess = plan.get("session") if isinstance(plan.get("session"), dict) else {}
+    want_u = str(plan.get("username") or (sess or {}).get("username") or "")
+    want_last = _session_last(sess) or _session_last(plan.get("click") or {})
+    if isinstance(got, dict):
+        name = _session_name(got)
+        uname = _session_username(got)
+        snippet = _session_last(got)
+        if want_u and uname and not _usernames_match(want_u, uname):
+            return False
+        if name and peer and not _display_names_match(name, peer):
+            return False
+        if want_last and snippet and not snippets_match(want_last, snippet):
+            return False
+        return True
+    if isinstance(got, str):
+        if peer and not _display_names_match(got, peer) and peer not in got and got not in peer:
+            return False
+        return True
+    return True
 
 def cli_send(args) -> int:
     peer = '' if args.peer is None else str(args.peer)
@@ -4266,7 +4397,7 @@ def cli_send(args) -> int:
     visible_rows = None
     # Live click needs the on-screen list (title + last snippet). Dry-run
     # tests inject sessions and must not OCR persist/watch/list.png.
-    if not dry and not already_open:
+    if not dry:
         persist = os.environ.get(
             "WECHAT_PERSIST", "/home/box/.local/share/wechat-persist"
         )

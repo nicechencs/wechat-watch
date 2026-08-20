@@ -3470,6 +3470,275 @@ class SendHelperTests(unittest.TestCase):
         self.assertLess(fill_at, submit_at)
         self.assertLess(submit_at, ok_at)
 
+    def test_cheng_unique_visual_row0_unread_not_chen_below(self):
+        """成🐰 at the top unread row is the click target, not a 陈 under a group."""
+        sessions = [
+            {
+                "name": "陈",
+                "username": "wxid_amsgrzqh10rc21",
+                "last": "[Name Card] 成🐰",
+            },
+            {
+                "name": "陈",
+                "username": "wxid_9qpru7ht5s4h12",
+                "last": "在修自动回复",
+            },
+            {
+                "name": "独立产品创业联盟3群",
+                "username": "50240319502@chatroom",
+                "last": "GPT 5.6 已上线",
+            },
+            {
+                "name": "成🐰",
+                "username": "wxid_iirwg5zdlh5t21",
+                "last": "我这就一直很纳闷，你到底在忙什么",
+            },
+        ]
+        visible = [
+            {
+                "name": "成🐰",
+                "last": "我这就一直很纳闷…",
+                "unread": 2,
+                "row": 0,
+                "x": 80,
+                "y": 100,
+                "w": 200,
+                "h": 70,
+            },
+            {
+                "name": "独立产品创业联盟3群",
+                "last": "GPT 5.6 已上线",
+                "x": 80,
+                "y": 170,
+                "w": 200,
+                "h": 70,
+            },
+            {
+                "name": "陈",
+                "last": "[Name Card] 成🐰",
+                "x": 80,
+                "y": 240,
+                "w": 200,
+                "h": 70,
+            },
+            {
+                "name": "陈",
+                "last": "在修自动回复",
+                "x": 80,
+                "y": 310,
+                "w": 200,
+                "h": 70,
+            },
+        ]
+        win = (129, 3, 1021, 740)
+        box = regions.window_crops(*win)["list"]
+        cheng_y = regions.list_row_point(box, visible[0])[1]
+        name_card_y = regions.list_row_point(box, visible[2])[1]
+        json_index_y = regions.list_row_point(box, {"row": 3})[1]
+        plan = regions.plan_private_send(
+            peer="成🐰",
+            text="好",
+            username="wxid_iirwg5zdlh5t21",
+            sessions=sessions,
+            visible_rows=visible,
+            win=win,
+            require_click_geom=True,
+        )
+        focus = [a for a in plan["actions"] if a["op"] == "focus-session"]
+        self.assertEqual(len(focus), 1)
+        self.assertEqual(focus[0]["y"], cheng_y)
+        self.assertNotEqual(focus[0]["y"], name_card_y)
+        self.assertNotEqual(focus[0]["y"], json_index_y)
+        self.assertEqual(plan["session"]["username"], "wxid_iirwg5zdlh5t21")
+
+        chen_plan = regions.plan_private_send(
+            peer="陈",
+            text="测发送",
+            username="wxid_9qpru7ht5s4h12",
+            sessions=sessions,
+            visible_rows=visible,
+            win=win,
+            require_click_geom=True,
+        )
+        chen_y = [a for a in chen_plan["actions"] if a["op"] == "focus-session"][0]["y"]
+        self.assertEqual(chen_y, regions.list_row_point(box, visible[3])[1])
+        self.assertNotEqual(chen_y, name_card_y)
+        self.assertNotEqual(chen_y, cheng_y)
+
+    def test_cannot_locate_visible_row_is_error_not_ok(self):
+        sessions = [
+            {
+                "name": "陈",
+                "username": "wxid_amsgrzqh10rc21",
+                "last": "[Name Card] 成🐰",
+            },
+            {
+                "name": "陈",
+                "username": "wxid_9qpru7ht5s4h12",
+                "last": "在修自动回复",
+            },
+        ]
+        # Only the name-card 陈 is on screen; the asked-for last does not match.
+        visible = [
+            {
+                "name": "陈",
+                "last": "[Name Card] 成🐰",
+                "x": 80,
+                "y": 240,
+                "w": 200,
+                "h": 70,
+            }
+        ]
+        with self.assertRaises(regions.SendRefused) as ctx:
+            regions.plan_private_send(
+                peer="陈",
+                text="好",
+                username="wxid_9qpru7ht5s4h12",
+                sessions=sessions,
+                visible_rows=visible,
+                win=(0, 0, 1280, 800),
+                require_click_geom=True,
+            )
+        self.assertIn(ctx.exception.error, ("peer-not-found", "ambiguous-peer"))
+
+        with self.assertRaises(regions.SendRefused) as ctx:
+            regions.run_send(
+                "陈",
+                "好",
+                username="wxid_9qpru7ht5s4h12",
+                sessions=sessions,
+                visible_rows=visible,
+                dry_run=False,
+                probe_window=False,
+                driver=regions.DrySendDriver(),
+            )
+        self.assertIn(ctx.exception.error, ("peer-not-found", "ambiguous-peer"))
+
+        # Unique JSON name without an on-screen hit box: live send must not ok:true.
+        with self.assertRaises(regions.SendRefused) as ctx:
+            regions.run_send(
+                "成🐰",
+                "好",
+                username="wxid_iirwg5zdlh5t21",
+                sessions=[
+                    {
+                        "name": "成🐰",
+                        "username": "wxid_iirwg5zdlh5t21",
+                        "last": "我这就一直很纳闷",
+                    }
+                ],
+                dry_run=False,
+                probe_window=False,
+                driver=regions.DrySendDriver(),
+            )
+        self.assertEqual(ctx.exception.error, "peer-not-found")
+
+    def test_already_open_omits_focus_only_for_that_peer(self):
+        sessions = [
+            {
+                "name": "陈",
+                "username": "wxid_9qpru7ht5s4h12",
+                "last": "在修自动回复",
+                "x": 80,
+                "y": 310,
+                "h": 70,
+            },
+            {
+                "name": "成🐰",
+                "username": "wxid_iirwg5zdlh5t21",
+                "last": "我这就一直很纳闷",
+                "x": 80,
+                "y": 100,
+                "h": 70,
+            },
+        ]
+        same = regions.plan_private_send(
+            peer="成🐰",
+            text="好",
+            username="wxid_iirwg5zdlh5t21",
+            sessions=sessions,
+            win=(0, 0, 1280, 800),
+            already_open=True,
+            open_username="wxid_iirwg5zdlh5t21",
+        )
+        self.assertNotIn("focus-session", [a["op"] for a in same["actions"]])
+
+        other = regions.plan_private_send(
+            peer="陈",
+            text="好",
+            username="wxid_9qpru7ht5s4h12",
+            sessions=sessions,
+            win=(0, 0, 1280, 800),
+            already_open=True,
+            open_username="wxid_iirwg5zdlh5t21",
+            require_click_geom=True,
+        )
+        ops = [a["op"] for a in other["actions"]]
+        self.assertEqual(ops[0], "focus-session")
+        self.assertEqual(other["session"]["username"], "wxid_9qpru7ht5s4h12")
+
+        drv = regions.DrySendDriver()
+        live = regions.run_send(
+            "陈",
+            "好",
+            username="wxid_9qpru7ht5s4h12",
+            sessions=sessions,
+            dry_run=False,
+            driver=drv,
+            probe_window=False,
+            already_open=True,
+            open_username="wxid_iirwg5zdlh5t21",
+        )
+        self.assertTrue(live["ok"])
+        kinds = {c.get("kind") for c in drv.calls if c.get("op") == "focus"}
+        self.assertIn("session", kinds)
+
+    def test_apply_false_when_selected_session_is_the_other_chen(self):
+        import wechat_watch_apply as apply_mod
+
+        class WrongThread:
+            def __init__(self):
+                self.calls = []
+
+            def raise_window(self, win_id=None):
+                self.calls.append(("raise", win_id or ""))
+
+            def click(self, x, y):
+                self.calls.append(("click", int(x), int(y)))
+
+            def paste(self, text):
+                self.calls.append(("paste", text))
+
+            def submit(self):
+                self.calls.append(("submit",))
+
+            def selected_session(self):
+                return {"name": "陈", "last": "[Name Card] 成🐰"}
+
+        plan = {
+            "peer": "成🐰",
+            "text": "好",
+            "username": "wxid_iirwg5zdlh5t21",
+            "session": {
+                "name": "成🐰",
+                "username": "wxid_iirwg5zdlh5t21",
+                "last": "我这就一直很纳闷",
+            },
+            "window_id": "0x200007",
+            "actions": [
+                {"op": "focus-session", "x": 272, "y": 137},
+                {"op": "focus-input", "x": 657, "y": 706},
+                {"op": "type", "text": "好"},
+                {"op": "submit"},
+            ],
+        }
+        fake = WrongThread()
+        with patch("wechat_watch_apply.time.sleep"):
+            ok = apply_mod.apply_send_plan(plan, x11=fake)
+        self.assertFalse(ok)
+        self.assertEqual(fake.calls[0][0], "raise")
+        self.assertEqual(fake.calls[1], ("click", 272, 137))
+
     def test_missing_args_mentions_send(self):
 
         proc = self._cli([])
