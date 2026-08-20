@@ -1694,6 +1694,18 @@ def parse_row_title(raw: str) -> str:
     return nick[:NICK_MAX_CHARS]
 
 
+def parse_row_preview(raw: str) -> str:
+    """Second+ OCR lines of a list row: last-message snippet under the title."""
+    if not raw:
+        return ""
+    lines = [ln.strip() for ln in raw.strip().splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return ""
+    preview = " ".join(lines[1:])
+    preview = re.sub(r"\s+", " ", preview).strip()
+    return preview[:80]
+
+
 def ocr_row_title(
     ffmpeg: str,
     src: str,
@@ -3737,26 +3749,136 @@ def input_box_point(
     return (int(cx), int(cy))
 
 
+def _session_last(rec) -> str:
+    if not isinstance(rec, dict):
+        return ""
+    for key in ("last", "preview", "snippet", "last_text"):
+        val = rec.get(key)
+        if val is not None and str(val).strip():
+            return str(val)
+    return ""
+
+
+def _display_names_match(a: str, b: str) -> bool:
+    na = normalize_nick(a or "") or (a or "").strip()
+    nb = normalize_nick(b or "") or (b or "").strip()
+    if not na or not nb:
+        return False
+    return na == nb or na.lower() == nb.lower()
+
+
+def _fold_snippet(text: str) -> str:
+    raw = (text or "").replace("\n", " ").replace("\r", " ")
+    raw = raw.replace("…", "").replace("...", "")
+    return re.sub(r"\s+", "", raw).lower()
+
+
+def snippets_match(a: str, b: str) -> bool:
+    """True if a list preview and a session last-message overlap."""
+    fa, fb = _fold_snippet(a), _fold_snippet(b)
+    if not fa or not fb:
+        return False
+    if fa == fb or fa in fb or fb in fa:
+        return True
+    n = min(len(fa), len(fb), 12)
+    if n >= 4 and (fa[:n] in fb or fb[:n] in fa):
+        return True
+    return False
+
+
+def _has_click_geom(rec: dict) -> bool:
+    if not isinstance(rec, dict):
+        return False
+    if rec.get("y") is not None:
+        return True
+    if rec.get("row") is not None:
+        return True
+    return False
+
+
+def locate_visible_list_row(
+    chosen: dict,
+    rows: list | None,
+    peer: str = "",
+) -> dict:
+    """On-screen left-list row for a matched session.
+
+    Username/JSON order is identity only. Click y comes from a visible row
+    whose title matches the display name, and whose preview matches `last`
+    when two rows share that name. Never uses JSON array index as y.
+    """
+    want_name = normalize_nick(chosen.get("name") or "") or str(chosen.get("name") or "").strip()
+    label = peer or want_name or str(chosen.get("username") or "")
+    pool: list[dict] = []
+    for rec in rows or []:
+        if isinstance(rec, str):
+            nm = parse_row_title(rec) or rec.strip()
+            if nm:
+                pool.append({"name": nm})
+            continue
+        if isinstance(rec, dict):
+            pool.append(rec)
+    named = [r for r in pool if _display_names_match(_session_name(r), want_name)]
+    if len(named) == 0:
+        return chosen
+    if len(named) == 1:
+        return named[0]
+    want_last = _session_last(chosen)
+    if want_last:
+        snipped = [r for r in named if snippets_match(_session_last(r), want_last)]
+        if len(snipped) == 1:
+            hit = snipped[0]
+            if _has_click_geom(hit):
+                return hit
+            raise SendRefused("ambiguous-peer", peer=label, text="")
+    raise SendRefused("ambiguous-peer", peer=label, text="")
+
+
 def list_row_point(
     list_box: tuple[int, int, int, int],
     rec: dict,
     row_h: int = UNREAD_ROW_H,
 ) -> tuple[int, int]:
-    lx, ly, lw, _lh = (int(v) for v in list_box)
-    if rec.get("x") is not None and rec.get("y") is not None:
-        x = int(rec["x"])
-        y = int(rec["y"])
+    """Click point for a visible list row (x/y, row band, or explicit row).
+
+    Do not treat a JSON sessions-array index as the on-screen row.
+    """
+    lx, ly, lw, lh = (int(v) for v in list_box)
+    x = rec.get("x")
+    y = rec.get("y")
+    if y is not None:
+        yi = int(y)
+        xi = int(x) if x is not None else 0
         w = int(rec.get("w") or max(1, lw))
         h = int(rec.get("h") or row_h)
-        return (x + max(24, min(w, lw) // 3), y + max(8, h // 2))
-    idx = int(rec.get("row") if rec.get("row") is not None else rec.get("index") or 0)
-    cy = ly + idx * row_h + row_h // 2
+        local = (yi < ly and 0 <= yi < lh) or (
+            x is not None and xi < lx and 0 <= xi < lw
+        )
+        if local:
+            yi = ly + yi
+            xi = lx + xi if x is not None else lx
+        elif x is None:
+            xi = lx
+        if x is None:
+            cx = lx + max(24, min(max(1, lw) // 2, 80))
+            return (int(cx), int(yi + max(8, h // 2)))
+        return (int(xi + max(24, min(w, lw) // 3)), int(yi + max(8, h // 2)))
+    if rec.get("row") is not None:
+        idx = int(rec["row"])
+        cy = ly + idx * row_h + row_h // 2
+        cx = lx + max(24, min(max(1, lw) // 2, 80))
+        return (int(cx), int(cy))
     cx = lx + max(24, min(max(1, lw) // 2, 80))
+    cy = ly + row_h // 2
     return (int(cx), int(cy))
 
 
 def sessions_from_row_recs(recs: list) -> list[dict]:
-    """Turn unread-like / OCR row dicts into send session records."""
+    """Turn unread-like / OCR row dicts into send session records.
+
+    Keep last/preview and real x/y or an explicit visual `row` band. Do not
+    invent `row` from the JSON array index — that is not the on-screen y.
+    """
     out: list[dict] = []
     for i, rec in enumerate(recs or []):
         if isinstance(rec, str):
@@ -3773,11 +3895,15 @@ def sessions_from_row_recs(recs: list) -> list[dict]:
         item = {
             "name": name,
             "username": str(rec.get("username") or rec.get("user") or rec.get("wxid") or ""),
-            "row": rec.get("row", i),
         }
+        if rec.get("row") is not None:
+            item["row"] = rec["row"]
         for k in ("x", "y", "w", "h"):
             if rec.get(k) is not None:
                 item[k] = rec[k]
+        last = _session_last(rec)
+        if last:
+            item["last"] = last
         out.append(item)
     return out
 
@@ -3889,6 +4015,7 @@ def plan_private_send(
     win: tuple[int, int, int, int] | None = None,
     crops: dict | None = None,
     already_open: bool = False,
+    visible_rows: list | None = None,
 ) -> dict:
     """Pure plan: validate, match existing 1:1, locate input. No desktop I/O."""
     checked = validate_send(peer, text, username=username)
@@ -3908,7 +4035,13 @@ def plan_private_send(
     inp = input_box_point(win_box, pane)
     actions: list[dict] = []
     if chosen is not None and not already_open:
-        row_pt = list_row_point(pane["list"], chosen)
+        rows = visible_rows if visible_rows is not None else sessions
+        click_rec = locate_visible_list_row(
+            chosen,
+            rows,
+            peer=checked["peer"] or peer,
+        )
+        row_pt = list_row_point(pane["list"], click_rec)
         actions.append({"op": "focus-session", "x": row_pt[0], "y": row_pt[1]})
     actions.append({"op": "focus-input", "x": inp[0], "y": inp[1]})
     actions.append({"op": "type", "text": checked["text"]})
@@ -4008,10 +4141,8 @@ def sessions_from_list_png(path: str, ffmpeg: str) -> list[dict]:
         for i, (y, bh) in enumerate(bands):
             nx = min(cw - 1, 56)
             nw = max(1, min(220, cw - nx - 36))
-            nh = max(1, min(36, bh))
-            ny = max(0, y + 4)
-            if ny + nh > ch:
-                nh = max(1, ch - ny)
+            ny = max(0, y + 2)
+            nh = max(1, min(bh - 4, ch - ny)) if bh > 4 else max(1, min(bh, ch - ny))
             dest = os.path.join(td, f"row{i}.png")
             try:
                 crop_png(ffmpeg, work, dest, (nx, ny, nw, nh))
@@ -4021,16 +4152,18 @@ def sessions_from_list_png(path: str, ffmpeg: str) -> list[dict]:
             name = parse_row_title(raw)
             if not name:
                 continue
-            out.append(
-                {
-                    "name": name,
-                    "row": i,
-                    "x": cx + nx,
-                    "y": cy + ny,
-                    "w": nw,
-                    "h": nh,
-                }
-            )
+            item = {
+                "name": name,
+                "row": i,
+                "x": cx + nx,
+                "y": cy + y,
+                "w": nw,
+                "h": bh,
+            }
+            preview = parse_row_preview(raw)
+            if preview:
+                item["last"] = preview
+            out.append(item)
     return out
 
 def run_send(
@@ -4047,6 +4180,7 @@ def run_send(
     atspi_extents: list | None = None,
     probe_window: bool = False,
     already_open: bool = False,
+    visible_rows: list | None = None,
 ) -> dict:
     checked = validate_send(peer, text, username=username)
     win, source = find_window(
@@ -4067,6 +4201,7 @@ def run_send(
             win=win,
             crops=pane,
             already_open=already_open,
+            visible_rows=visible_rows,
         )
     else:
         if not dry_run:
@@ -4079,6 +4214,7 @@ def run_send(
             win=win,
             crops=pane,
             already_open=already_open,
+            visible_rows=visible_rows,
         )
     if dry_run:
         return {
@@ -4126,6 +4262,22 @@ def cli_send(args) -> int:
             emit_send_result(False, peer, text, error='bad-sessions')
             print(f'ERROR: send sessions: {exc}', file=sys.stderr)
             return 2
+    already_open = bool(getattr(args, "already_open", False))
+    visible_rows = None
+    # Live click needs the on-screen list (title + last snippet). Dry-run
+    # tests inject sessions and must not OCR persist/watch/list.png.
+    if not dry and not already_open:
+        persist = os.environ.get(
+            "WECHAT_PERSIST", "/home/box/.local/share/wechat-persist"
+        )
+        list_png = os.path.join(persist, "watch", "list.png")
+        if os.path.isfile(list_png):
+            try:
+                visible_rows = sessions_from_list_png(
+                    list_png, resolve_ffmpeg(default_ffmpeg())
+                )
+            except (OSError, ValueError, subprocess.CalledProcessError):
+                visible_rows = None
     try:
         result = run_send(
             peer,
@@ -4134,7 +4286,8 @@ def cli_send(args) -> int:
             sessions=sessions,
             dry_run=dry,
             probe_window=not dry,
-            already_open=bool(getattr(args, "already_open", False)),
+            already_open=already_open,
+            visible_rows=visible_rows,
         )
     except SendRefused as exc:
         emit_send_result(

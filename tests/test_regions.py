@@ -2843,6 +2843,23 @@ class SendHelperTests(unittest.TestCase):
             apply.assert_not_called()
             execute.assert_not_called()
 
+        drv = regions.DrySendDriver()
+        with patch("wechat_watch_apply.apply_send_plan") as geom2, patch(
+            "wechat_watch_apply.apply_private_text"
+        ) as apply2:
+            quiet = regions.run_send(
+                "阿坤",
+                "好",
+                sessions=[{"name": "阿坤", "row": 1}],
+                dry_run=True,
+                driver=drv,
+                probe_window=False,
+            )
+            self.assertTrue(quiet["ok"])
+            self.assertEqual(drv.calls, [])
+            geom2.assert_not_called()
+            apply2.assert_not_called()
+
     def test_stub_apply_invoked_once(self):
         with patch("wechat_watch_apply.apply_send_plan") as geom, patch(
             "wechat_watch_apply.apply_private_text"
@@ -2933,17 +2950,27 @@ class SendHelperTests(unittest.TestCase):
                                 "username": "wxid_chen_a",
                                 "display": "陈",
                                 "kind": "private",
+                                "last": "[Name Card] 成🐰",
+                                "x": 80,
+                                "y": 240,
+                                "h": 70,
                             },
                             {
                                 "username": "wxid_chen_b",
                                 "display": "陈",
                                 "kind": "private",
+                                "last": "在修自动回复",
+                                "x": 80,
+                                "y": 310,
+                                "h": 70,
                             },
                         ],
                     },
                     fh,
                     ensure_ascii=False,
                 )
+            recs = regions.load_sessions_json(path)
+            self.assertEqual(recs[0].get("last"), "[Name Card] 成🐰")
             proc = self._cli(
                 [
                     "send",
@@ -2963,6 +2990,180 @@ class SendHelperTests(unittest.TestCase):
             self.assertTrue(rec["ok"])
             self.assertEqual(rec["peer"], "陈")
             self.assertEqual(rec["text"], "好")
+
+    def test_two_chen_click_is_visual_row_not_json_index(self):
+        """Username match is JSON row 3; the on-screen 陈 with that last is lower."""
+        sessions = [
+            {
+                "name": "独立产品创业联盟3群",
+                "username": "50240319502@chatroom",
+                "last": "GPT 5.6 已上线",
+            },
+            {
+                "name": "成🐰",
+                "username": "wxid_cheng",
+                "last": "怎么不回我消息呀",
+            },
+            {
+                "name": "陈",
+                "username": "wxid_amsgrzqh10rc21",
+                "last": "[Name Card] 成🐰",
+            },
+            {
+                "name": "陈",
+                "username": "wxid_9qpru7ht5s4h12",
+                "last": "在修自动回复，刚才你好卡住了已经补上了，现在在测发送。",
+            },
+        ]
+        visible = [
+            {
+                "name": "独立产品创业联盟3群",
+                "last": "GPT 5.6 已上线",
+                "x": 80,
+                "y": 100,
+                "w": 200,
+                "h": 70,
+            },
+            {
+                "name": "成🐰",
+                "last": "怎么不回我消息呀",
+                "x": 80,
+                "y": 170,
+                "w": 200,
+                "h": 70,
+            },
+            {
+                "name": "陈",
+                "last": "[Name Card] 成🐰",
+                "x": 80,
+                "y": 240,
+                "w": 200,
+                "h": 70,
+            },
+            {
+                "name": "陈",
+                "last": "在修自动回复",
+                "x": 80,
+                "y": 310,
+                "w": 200,
+                "h": 70,
+            },
+        ]
+        win = (0, 0, 1280, 800)
+        box = regions.window_crops(*win)["list"]
+        json_index_y = regions.list_row_point(box, {"row": 3})[1]
+        name_card_y = regions.list_row_point(box, visible[2])[1]
+        target_y = regions.list_row_point(box, visible[3])[1]
+        self.assertEqual(json_index_y, name_card_y)
+
+        hit = regions.match_peer(
+            "陈", sessions, username="wxid_9qpru7ht5s4h12"
+        )
+        self.assertEqual(hit.get("username"), "wxid_9qpru7ht5s4h12")
+        plan = regions.plan_private_send(
+            peer="陈",
+            text="测试，请忽略",
+            username="wxid_9qpru7ht5s4h12",
+            sessions=sessions,
+            visible_rows=visible,
+            win=win,
+        )
+        focus = [a for a in plan["actions"] if a["op"] == "focus-session"]
+        self.assertEqual(len(focus), 1)
+        self.assertEqual(focus[0]["y"], target_y)
+        self.assertNotEqual(focus[0]["y"], name_card_y)
+        self.assertNotEqual(focus[0]["y"], json_index_y)
+        self.assertEqual(plan["session"]["username"], "wxid_9qpru7ht5s4h12")
+
+        other = regions.plan_private_send(
+            peer="陈",
+            text="好",
+            username="wxid_amsgrzqh10rc21",
+            sessions=sessions,
+            visible_rows=visible,
+            win=win,
+        )
+        other_y = [a for a in other["actions"] if a["op"] == "focus-session"][0]["y"]
+        self.assertEqual(other_y, name_card_y)
+        self.assertNotEqual(other_y, target_y)
+
+        with self.assertRaises(regions.SendRefused) as ctx:
+            regions.plan_private_send(
+                peer="陈",
+                text="好",
+                username="wxid_9qpru7ht5s4h12",
+                sessions=sessions,
+                win=win,
+            )
+        self.assertEqual(ctx.exception.error, "ambiguous-peer")
+
+    def test_unique_name_json_only_uses_fixture_geom(self):
+        xy = {
+            "name": "阿坤",
+            "username": "wxid_akun",
+            "x": 90,
+            "y": 200,
+            "w": 180,
+            "h": 70,
+        }
+        plan = regions.plan_private_send(
+            peer="阿坤",
+            text="好",
+            sessions=[xy, {"name": "独立产品创业联盟3群"}],
+            win=(0, 0, 1280, 800),
+        )
+        focus = [a for a in plan["actions"] if a["op"] == "focus-session"][0]
+        box = regions.window_crops(0, 0, 1280, 800)["list"]
+        self.assertEqual((focus["x"], focus["y"]), regions.list_row_point(box, xy))
+
+        band = [{"name": "阿坤", "username": "wxid_akun", "row": 2}]
+        plan2 = regions.plan_private_send(
+            peer="阿坤",
+            text="好",
+            sessions=band,
+            win=(0, 0, 1280, 800),
+        )
+        focus2 = [a for a in plan2["actions"] if a["op"] == "focus-session"][0]
+        self.assertEqual(
+            (focus2["x"], focus2["y"]), regions.list_row_point(box, band[0])
+        )
+        self.assertNotEqual(focus2["y"], regions.list_row_point(box, {"row": 0})[1])
+
+    def test_two_chen_identical_last_is_ambiguous(self):
+        sessions = [
+            {"name": "陈", "username": "wxid_chen_a", "last": "hello"},
+            {"name": "陈", "username": "wxid_chen_b", "last": "hello"},
+        ]
+        visible = [
+            {"name": "陈", "last": "hello", "x": 80, "y": 240, "h": 70},
+            {"name": "陈", "last": "hello", "x": 80, "y": 310, "h": 70},
+        ]
+        with self.assertRaises(regions.SendRefused) as ctx:
+            regions.plan_private_send(
+                peer="陈",
+                text="好",
+                username="wxid_chen_b",
+                sessions=sessions,
+                visible_rows=visible,
+                win=(0, 0, 1280, 800),
+            )
+        self.assertEqual(ctx.exception.error, "ambiguous-peer")
+        # Username still uniquely identifies the session; the click cannot.
+        hit = regions.match_peer("陈", sessions, username="wxid_chen_b")
+        self.assertEqual(hit.get("username"), "wxid_chen_b")
+
+        plan = regions.plan_private_send(
+            peer="陈",
+            text="好",
+            username="wxid_chen_b",
+            sessions=sessions,
+            visible_rows=visible,
+            win=(0, 0, 1280, 800),
+            already_open=True,
+        )
+        ops = [a["op"] for a in plan["actions"]]
+        self.assertNotIn("focus-session", ops)
+        self.assertEqual(ops[0], "focus-input")
 
     def test_cli_username_without_sessions_json_uses_wxcli(self):
         payload = {
