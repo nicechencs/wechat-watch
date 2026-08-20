@@ -19,6 +19,8 @@
 
 一次未变化的检查大约只需一次 ffmpeg 截屏 + sha256，耗时大约 200–400ms。
 
+**P0 本地门闩（砍 LLM 轮次）：** `sessions-changed` 只比较 wx-cli sessions；`wx-watch-gate` 每 10s 在 shell 里跑它，exit 0 不叫醒模型，exit 1 才 POST Grok Bot webhook。办法见 [docs/watch-gate.md](docs/watch-gate.md)。
+
 ## 工作原理
 
 ```

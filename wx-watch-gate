@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+"""Poll sessions-changed locally; ping Grok Bot webhook only on incoming.
+
+Exit-code mapping (sessions-changed):
+  0  unchanged / quiet self-outgoing — log one line, no POST
+  1  incoming private or group — POST webhook (or WOULD_PING dry-run)
+  2  wx-cli need_unlock — optionally unlock derive once, then retry; no loop-bomb
+  5  human login needed — write once-file, stop posting
+  other wx-cli codes — log, stay up
+
+Debounce: skip POST if the last successful POST was < WX_GATE_DEBOUNCE seconds
+ago (default 20), or if sessions-changed is still exit 1 for the same change
+because prev was not updated yet.
+
+Webhook env (never commit real values):
+  WX_WATCH_WEBHOOK_URL
+  WX_WATCH_WEBHOOK_KEY
+Optional:
+  WX_WATCH_WEBHOOK_AUTH_HEADER  default Authorization
+  WX_GATE_INTERVAL              default 10
+  WX_GATE_DEBOUNCE              default 20
+  WX_SESSIONS_CHANGED           path to sessions-changed
+  WX_WATCH_CURL                 curl binary (tests inject a mock)
+  WX_WATCH_PERSIST              persist/watch directory
+
+Does not decrypt, does not read live WeChat DBs, does not reimplement refresh.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Callable
+from urllib.parse import urlsplit
+
+DEFAULT_INTERVAL = 10
+DEFAULT_DEBOUNCE = 20
+DEFAULT_PERSIST = "/home/box/.local/share/wechat-persist/watch"
+DEFAULT_GATE = "/home/box/wechat-watch/sessions-changed"
+DEFAULT_WX_ROOT = "/home/box/wx-linux-read"
+DEFAULT_AUTH_HEADER = "Authorization"
+LOGIN_ONCE_NAME = "wx-watch-gate.login-needed"
+STATE_NAME = "wx-watch-gate.state.json"
+LOG_NAME = "wx-watch-gate.log"
+PID_NAME = "wx-watch-gate.pid"
+ENV_NAME = "webhook.env"
+
+
+def persist_dir() -> Path:
+    return Path(os.environ.get("WX_WATCH_PERSIST", DEFAULT_PERSIST))
+
+
+def gate_path() -> Path:
+    env = os.environ.get("WX_SESSIONS_CHANGED")
+    if env:
+        return Path(env)
+    repo = Path(__file__).resolve().parent / "sessions-changed"
+    if repo.is_file():
+        return repo
+    persist_copy = persist_dir() / "sessions-changed"
+    if persist_copy.is_file():
+        return persist_copy
+    return Path(DEFAULT_GATE)
+
+
+def log_path() -> Path:
+    return persist_dir() / LOG_NAME
+
+
+def state_path() -> Path:
+    return persist_dir() / STATE_NAME
+
+
+def login_once_path() -> Path:
+    return persist_dir() / LOGIN_ONCE_NAME
+
+
+def pid_path() -> Path:
+    return persist_dir() / PID_NAME
+
+
+def env_file_path() -> Path:
+    return Path(os.environ.get("WX_WATCH_WEBHOOK_ENV", str(persist_dir() / ENV_NAME)))
+
+
+def interval() -> float:
+    try:
+        return max(1.0, float(os.environ.get("WX_GATE_INTERVAL", DEFAULT_INTERVAL)))
+    except ValueError:
+        return float(DEFAULT_INTERVAL)
+
+
+def debounce_sec() -> float:
+    try:
+        return max(0.0, float(os.environ.get("WX_GATE_DEBOUNCE", DEFAULT_DEBOUNCE)))
+    except ValueError:
+        return float(DEFAULT_DEBOUNCE)
+
+
+def load_dotenv(path: Path) -> None:
+    """Load KEY=VALUE lines into os.environ if the key is not already set."""
+    if not path.is_file():
+        return
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip().strip("'").strip('"')
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
+def webhook_creds() -> tuple[str, str]:
+    url = (os.environ.get("WX_WATCH_WEBHOOK_URL") or "").strip()
+    key = (os.environ.get("WX_WATCH_WEBHOOK_KEY") or "").strip()
+    return url, key
+
+
+def webhook_ready(url: str, key: str) -> bool:
+    return bool(url) and bool(key)
+
+
+def auth_header_name() -> str:
+    return (os.environ.get("WX_WATCH_WEBHOOK_AUTH_HEADER") or DEFAULT_AUTH_HEADER).strip() or DEFAULT_AUTH_HEADER
+
+
+def bearer_value(key: str) -> str:
+    k = key.strip()
+    if k.lower().startswith("bearer "):
+        return k
+    return f"Bearer {k}"
+
+
+def parse_n(stdout: str) -> int:
+    m = re.search(r"\bn=(\d+)\b", stdout or "")
+    if m:
+        return int(m.group(1))
+    m = re.search(r"\bact=(\d+)\b", stdout or "")
+    if m:
+        return int(m.group(1))
+    return 0
+
+
+def fingerprint(stdout: str) -> str:
+    body = (stdout or "").strip()
+    if not body:
+        return ""
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+
+
+def short_log(msg: str) -> str:
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    return f"{ts} {msg}"
+
+
+def append_log(msg: str) -> None:
+    line = short_log(msg)
+    try:
+        persist_dir().mkdir(parents=True, exist_ok=True)
+        with log_path().open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    print(line, flush=True)
+
+
+def load_state() -> dict[str, Any]:
+    p = state_path()
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict[str, Any]) -> None:
+    persist_dir().mkdir(parents=True, exist_ok=True)
+    tmp = state_path().with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(state_path())
+
+
+def login_needed() -> bool:
+    return login_once_path().is_file()
+
+
+def write_login_needed() -> None:
+    persist_dir().mkdir(parents=True, exist_ok=True)
+    login_once_path().write_text("human login required (sessions-changed exit 5)\n", encoding="utf-8")
+
+
+def redact_url(url: str) -> str:
+    try:
+        parts = urlsplit(url)
+        host = parts.netloc or "-"
+        path = parts.path or ""
+        return f"{parts.scheme}://{host}{path[:24]}"
+    except Exception:
+        return "-"
+
+
+def build_ping_body(stdout: str) -> dict[str, Any]:
+    return {"reason": "sessions-changed", "n": parse_n(stdout)}
+
+
+def build_curl_argv(url: str, key: str, body: dict[str, Any]) -> list[str]:
+    curl = os.environ.get("WX_WATCH_CURL", "curl")
+    payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    return [
+        curl,
+        "-sS",
+        "-m",
+        "15",
+        "-X",
+        "POST",
+        url,
+        "-H",
+        f"{auth_header_name()}: {bearer_value(key)}",
+        "-H",
+        "Content-Type: application/json",
+        "-d",
+        payload,
+    ]
+
+
+def should_debounce(
+    now: float,
+    state: dict[str, Any],
+    fp: str,
+    window: float,
+) -> str:
+    """Return '' (ok to post), 'recent', or 'stale'."""
+    last_ts = state.get("last_post_ts")
+    last_fp = state.get("last_fp") or ""
+    try:
+        last_ts_f = float(last_ts) if last_ts is not None else None
+    except (TypeError, ValueError):
+        last_ts_f = None
+    if last_ts_f is not None and (now - last_ts_f) < window:
+        return "recent"
+    if last_fp and fp and last_fp == fp and state.get("awaiting_prev"):
+        return "stale"
+    return ""
+
+
+def decide_exit1(
+    now: float,
+    state: dict[str, Any],
+    stdout: str,
+    url: str,
+    key: str,
+    window: float | None = None,
+) -> dict[str, Any]:
+    """Pure mapping for sessions-changed exit 1. No I/O."""
+    if login_needed() or state.get("login_needed"):
+        return {"action": "login_stop", "log": "LOGIN_NEEDED skip-post", "body": None}
+    fp = fingerprint(stdout)
+    why = should_debounce(now, state, fp, window if window is not None else debounce_sec())
+    body = build_ping_body(stdout)
+    if why == "recent":
+        return {"action": "debounce", "log": f"DEBOUNCE recent fp={fp} n={body['n']}", "body": body, "fp": fp}
+    if why == "stale":
+        return {"action": "stale", "log": f"DEBOUNCE stale-exit1 fp={fp} n={body['n']}", "body": body, "fp": fp}
+    if not webhook_ready(url, key):
+        return {
+            "action": "would_ping",
+            "log": f"WOULD_PING dry-run n={body['n']} fp={fp}",
+            "body": body,
+            "fp": fp,
+        }
+    return {
+        "action": "ping",
+        "log": f"PING n={body['n']} fp={fp} url={redact_url(url)}",
+        "body": body,
+        "fp": fp,
+    }
+
+
+def decide_quiet(stdout: str) -> dict[str, Any]:
+    first = (stdout or "").strip().splitlines()[0] if (stdout or "").strip() else "UNCHANGED"
+    return {"action": "quiet", "log": f"QUIET {first[:160]}", "body": None}
+
+
+def run_cmd(argv: list[str], cwd: str | None = None, timeout: float = 60) -> tuple[int, str, str]:
+    try:
+        p = subprocess.run(
+            argv,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError as e:
+        return 10, "", f"missing {e.filename or argv[0]}"
+    except subprocess.TimeoutExpired:
+        return 10, "", "timeout"
+    return p.returncode, p.stdout or "", p.stderr or ""
+
+
+def run_sessions_changed() -> tuple[int, str, str]:
+    path = gate_path()
+    if not path.is_file():
+        return 10, "", f"missing-gate {path}"
+    # Honor shebang so tests can inject a shell mock; python3 fallback if needed.
+    argv = [str(path)] if os.access(path, os.X_OK) else [sys.executable, str(path)]
+    return run_cmd(argv, timeout=90)
+
+
+def run_unlock_derive() -> tuple[int, str, str]:
+    wx_root = Path(os.environ.get("WX_LINUX_READ", DEFAULT_WX_ROOT))
+    cli = wx_root / "wx-cli"
+    if not cli.is_file():
+        return 10, "", f"missing-cli {cli}"
+    return run_cmd([str(cli), "unlock", "derive", "--json"], cwd=str(wx_root), timeout=90)
+
+
+def post_webhook(
+    url: str,
+    key: str,
+    body: dict[str, Any],
+    runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
+) -> tuple[bool, str]:
+    argv = build_curl_argv(url, key, body)
+    run = runner or (lambda a: run_cmd(a, timeout=20))
+    code, out, err = run(argv)
+    if code == 0:
+        return True, (out or "").strip()[:200]
+    return False, (err or out or f"curl-exit-{code}").strip()[:200]
+
+
+def mark_posted(state: dict[str, Any], now: float, fp: str) -> dict[str, Any]:
+    nxt = dict(state)
+    nxt["last_post_ts"] = now
+    nxt["last_fp"] = fp
+    nxt["awaiting_prev"] = True
+    nxt.pop("login_needed", None)
+    return nxt
+
+
+def mark_quiet(state: dict[str, Any]) -> dict[str, Any]:
+    nxt = dict(state)
+    nxt["awaiting_prev"] = False
+    return nxt
+
+
+def handle_tick(
+    code: int,
+    stdout: str,
+    now: float,
+    state: dict[str, Any],
+    url: str,
+    key: str,
+    unlock_attempted: bool,
+) -> dict[str, Any]:
+    """Map one sessions-changed result to an action. Pure besides login_once file check."""
+    if code == 0:
+        d = decide_quiet(stdout)
+        d["state"] = mark_quiet(state)
+        return d
+    if code == 1:
+        d = decide_exit1(now, state, stdout, url, key)
+        d["state"] = state
+        return d
+    if code == 2:
+        if unlock_attempted or state.get("unlock_attempted"):
+            return {
+                "action": "unlock_skip",
+                "log": "UNLOCK skip already-attempted",
+                "body": None,
+                "state": state,
+            }
+        return {
+            "action": "unlock_retry",
+            "log": "UNLOCK derive-once then retry",
+            "body": None,
+            "state": {**state, "unlock_attempted": True},
+        }
+    if code == 5:
+        return {
+            "action": "login_stop",
+            "log": "LOGIN_NEEDED write-once-file stop-posting",
+            "body": None,
+            "state": {**state, "login_needed": True},
+            "write_login_needed": True,
+        }
+    return {
+        "action": "error",
+        "log": f"GATE_ERROR code={code} {(stdout or '')[:80]}",
+        "body": None,
+        "state": state,
+    }
+
+
+def apply_decision(
+    decision: dict[str, Any],
+    now: float,
+    poster: Callable[[str, str, dict[str, Any]], tuple[bool, str]] | None = None,
+) -> str:
+    action = decision["action"]
+    append_log(decision["log"])
+    state = dict(decision.get("state") or {})
+    url, key = webhook_creds()
+
+    if decision.get("write_login_needed"):
+        write_login_needed()
+
+    if action == "would_ping":
+        state = mark_posted(state, now, decision.get("fp") or fingerprint(""))
+        save_state(state)
+        return action
+
+    if action == "ping":
+        body = decision.get("body") or build_ping_body("")
+        post = poster or (lambda u, k, b: post_webhook(u, k, b))
+        ok, detail = post(url, key, body)
+        if ok:
+            append_log(f"PING_OK n={body.get('n')}")
+            save_state(mark_posted(state, now, decision.get("fp") or ""))
+        else:
+            append_log(f"PING_FAIL {detail}")
+            save_state(state)
+        return "ping_ok" if ok else "ping_fail"
+
+    save_state(state)
+    return action
+
+
+def one_tick(
+    poster: Callable[[str, str, dict[str, Any]], tuple[bool, str]] | None = None,
+    gate_runner: Callable[[], tuple[int, str, str]] | None = None,
+    unlock_runner: Callable[[], tuple[int, str, str]] | None = None,
+    clock: Callable[[], float] | None = None,
+) -> str:
+    load_dotenv(env_file_path())
+    now = (clock or time.time)()
+    state = load_state()
+    url, key = webhook_creds()
+    run_gate = gate_runner or run_sessions_changed
+    code, out, err = run_gate()
+    if err and code not in (0, 1):
+        append_log(f"GATE_STDERR code={code} {err[:120]}")
+    decision = handle_tick(code, out, now, state, url, key, bool(state.get("unlock_attempted")))
+    if decision["action"] == "unlock_retry":
+        append_log(decision["log"])
+        save_state(decision["state"])
+        u_code, u_out, u_err = (unlock_runner or run_unlock_derive)()
+        append_log(f"UNLOCK_DONE code={u_code} {(u_out or u_err)[:80]}")
+        code2, out2, err2 = run_gate()
+        if err2 and code2 not in (0, 1):
+            append_log(f"GATE_STDERR code={code2} {err2[:120]}")
+        decision = handle_tick(
+            code2, out2, (clock or time.time)(), load_state(), url, key, True
+        )
+        if decision["action"] == "unlock_retry":
+            decision = {
+                "action": "unlock_skip",
+                "log": "UNLOCK skip no-loop-bomb",
+                "body": None,
+                "state": load_state(),
+            }
+    return apply_decision(decision, now, poster=poster)
+
+
+def write_pid() -> None:
+    persist_dir().mkdir(parents=True, exist_ok=True)
+    pid_path().write_text(str(os.getpid()) + "\n", encoding="utf-8")
+
+
+def clear_pid() -> None:
+    try:
+        p = pid_path()
+        if p.is_file() and p.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            p.unlink()
+    except OSError:
+        pass
+
+
+def loop() -> int:
+    load_dotenv(env_file_path())
+    write_pid()
+
+    def _stop(signum: int, _frame: Any) -> None:
+        append_log(f"STOP signal={signum}")
+        clear_pid()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    url, key = webhook_creds()
+    mode = "live" if webhook_ready(url, key) else "dry-run"
+    append_log(f"START interval={interval()}s debounce={debounce_sec()}s mode={mode}")
+    while True:
+        try:
+            one_tick()
+        except Exception as e:
+            append_log(f"TICK_ERROR {type(e).__name__}: {e}")
+        time.sleep(interval())
+
+
+def usage() -> None:
+    print(
+        "usage: wx-watch-gate [--once|--loop|--help]\n"
+        "  --once   one poll tick (tests / cron)\n"
+        "  --loop   daemon (default when no args and WX_GATE_LOOP=1)\n",
+        file=sys.stderr,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args:
+        args = ["--loop"] if os.environ.get("WX_GATE_LOOP") == "1" else ["--once"]
+    if args[0] in ("-h", "--help"):
+        usage()
+        return 0
+    if args[0] in ("--once", "once"):
+        one_tick()
+        return 0
+    if args[0] in ("--loop", "loop"):
+        loop()
+        return 0
+    usage()
+    return 4
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        print(f"error wrapper {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(10)

@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Cheap WeChat gate: refresh + sessions vs sessions.prev.json.
+
+Exit 0: unchanged, or only self-outgoing / official / system (stay silent).
+Exit 1: incoming private or group change (agent should act).
+Exit 2/3/4/5/6: wx-cli codes (need_unlock / deps / usage / human / security).
+Exit 10: wrapper/IO error.
+
+Does not decrypt, does not read live DBs, does not update prev on CHANGED.
+On exit 0 with a quiet state change, writes sessions.prev.json so the next
+tick stays silent. Writes /tmp/wx-sessions.json on CHANGED for --send.
+
+Not a production cron replacement. Reversible: delete this file.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+WX_ROOT = Path(os.environ.get("WX_LINUX_READ", "/home/box/wx-linux-read"))
+CLI = WX_ROOT / "wx-cli"
+PREV = Path(
+    os.environ.get(
+        "WX_SESSIONS_PREV",
+        "/home/box/.local/share/wechat-persist/watch/sessions.prev.json",
+    )
+)
+SESS_OUT = Path(os.environ.get("WX_SESSIONS_OUT", "/tmp/wx-sessions.json"))
+LIMIT = int(os.environ.get("WX_SESSIONS_LIMIT", "30"))
+QUIET_KINDS = {"official", "system"}
+COMPARE_FIELDS = ("unread", "last", "ts", "last_is_self", "last_from_username")
+
+
+def run_cli(*args: str) -> tuple[int, dict]:
+    cmd = [str(CLI), *args, "--json"]
+    p = subprocess.run(
+        cmd,
+        cwd=str(WX_ROOT),
+        capture_output=True,
+        text=True,
+    )
+    raw = (p.stdout or "").strip()
+    body: dict = {}
+    if raw:
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError:
+            body = {"ok": False, "error": {"message": raw[:400]}}
+    if not body and p.returncode != 0:
+        err = (p.stderr or "").strip()[:400]
+        body = {"ok": False, "code": p.returncode, "error": {"message": err}}
+    return int(body.get("code", p.returncode) or 0), body
+
+
+def compact(s: dict) -> dict:
+    return {
+        "u": s.get("username") or "",
+        "d": s.get("display") or "",
+        "kind": s.get("kind") or "",
+        "unread": s.get("unread") or 0,
+        "last": s.get("last") or "",
+        "ts": s.get("sort_timestamp") or 0,
+        "last_is_self": bool(s.get("last_is_self")),
+        "last_from_username": s.get("last_from_username") or "",
+    }
+
+
+def load_prev() -> dict[str, dict]:
+    if not PREV.is_file():
+        return {}
+    raw = json.loads(PREV.read_text(encoding="utf-8"))
+    sessions = raw.get("sessions") if isinstance(raw, dict) else raw
+    out = {}
+    for s in sessions or []:
+        u = s.get("u") or s.get("username")
+        if u:
+            out[u] = s
+    return out
+
+
+def write_prev(items: list[dict]) -> None:
+    PREV.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PREV.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps({"sessions": items}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    tmp.replace(PREV)
+
+
+def classify(cur: dict, prev: dict | None) -> str:
+    """Return 'quiet' or 'act'."""
+    if cur["kind"] in QUIET_KINDS:
+        return "quiet"
+    if prev is None:
+        return "act"
+    ch = [k for k in COMPARE_FIELDS if prev.get(k) != cur[k]]
+    if not ch:
+        return "quiet"
+    unread_up = int(cur["unread"] or 0) > int(prev.get("unread") or 0)
+    if unread_up:
+        return "act"
+    if ch == ["last_is_self"] and cur["last_is_self"]:
+        return "quiet"
+    if cur["last_is_self"] and not unread_up and "unread" not in ch:
+        # own outgoing updated last/ts; routine says stay silent
+        return "quiet"
+    return "act"
+
+
+def main() -> int:
+    if not CLI.is_file():
+        print("error missing-cli", CLI, file=sys.stderr)
+        return 10
+
+    rcode, refresh = run_cli("unlock", "refresh")
+    if rcode != 0:
+        err = (refresh.get("error") or {}).get("type") or (refresh.get("error") or {}).get(
+            "message"
+        ) or "refresh-failed"
+        print(f"error refresh code={rcode} {err}")
+        return rcode if rcode in (2, 3, 4, 5, 6) else 10
+
+    scode, sessions_body = run_cli("chat", "sessions", "--limit", str(LIMIT))
+    if scode != 0:
+        err = (sessions_body.get("error") or {}).get("type") or (
+            sessions_body.get("error") or {}
+        ).get("message") or "sessions-failed"
+        print(f"error sessions code={scode} {err}")
+        return scode if scode in (2, 3, 4, 5, 6) else 10
+
+    items = [compact(s) for s in sessions_body.get("sessions") or []]
+    prev = load_prev()
+    diffs = []
+    need_act = False
+    for cur in items:
+        p = prev.get(cur["u"])
+        ch = [k for k in COMPARE_FIELDS if (p or {}).get(k) != cur[k]]
+        if p is None:
+            ch = ["new"]
+        if not ch:
+            continue
+        kind = classify(cur, p)
+        rec = {
+            "u": cur["u"],
+            "d": cur["d"],
+            "kind": cur["kind"],
+            "fields": ch,
+            "last_is_self": cur["last_is_self"],
+            "unread": cur["unread"],
+            "gate": kind,
+        }
+        diffs.append(rec)
+        if kind == "act":
+            need_act = True
+
+    skipped = bool(refresh.get("skipped"))
+    if not diffs:
+        print(f"UNCHANGED refresh_skipped={json.dumps(skipped)} n={len(items)}")
+        return 0
+
+    if not need_act:
+        write_prev(items)
+        print(
+            f"UNCHANGED quiet={len(diffs)} refresh_skipped={json.dumps(skipped)} n={len(items)}"
+        )
+        print(json.dumps(diffs, ensure_ascii=False))
+        return 0
+
+    SESS_OUT.write_text(
+        json.dumps(sessions_body, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    print(
+        f"CHANGED act={sum(1 for d in diffs if d['gate']=='act')} "
+        f"quiet={sum(1 for d in diffs if d['gate']=='quiet')} "
+        f"refresh_skipped={json.dumps(skipped)} n={len(items)} "
+        f"sessions_json={SESS_OUT}"
+    )
+    print(json.dumps(diffs, ensure_ascii=False))
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        print(f"error wrapper {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(10)

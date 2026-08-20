@@ -1,0 +1,173 @@
+#!/bin/bash
+# Install persist copies of the WeChat watch gate and start/stop the daemon.
+# Does not touch WeChat restore. Safe to re-run. Dry-run if webhook.env is empty.
+set -euo pipefail
+
+REPO="${WX_WATCH_REPO:-/home/box/wechat-watch}"
+PERSIST_ROOT="${WECHAT_PERSIST:-/home/box/.local/share/wechat-persist}"
+WATCH="$PERSIST_ROOT/watch"
+BIN_DIR="${WX_WATCH_BIN_DIR:-/home/box/.local/bin}"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+
+GATE_SRC="$REPO/wx-watch-gate"
+SESS_SRC="$REPO/sessions-changed"
+GATE_DST="$WATCH/wx-watch-gate"
+SESS_DST="$WATCH/sessions-changed"
+WRAP="$BIN_DIR/wx-watch-gate"
+ENSURE_WRAP="$BIN_DIR/ensure-wx-watch-gate"
+ENV_FILE="$WATCH/webhook.env"
+ENV_EXAMPLE="$REPO/webhook.env.example"
+PID_FILE="$WATCH/wx-watch-gate.pid"
+LOG="$WATCH/wx-watch-gate.log"
+
+log() { echo "[$(date -Is)] $*"; }
+
+usage() {
+  echo "usage: ensure-wx-watch-gate [install|start|stop|restart|status]" >&2
+}
+
+install_files() {
+  mkdir -p "$WATCH" "$BIN_DIR"
+  if [ ! -f "$GATE_SRC" ]; then
+    log "ERROR: missing $GATE_SRC"
+    return 1
+  fi
+  cp -f "$GATE_SRC" "$GATE_DST"
+  chmod 0755 "$GATE_DST"
+  if [ -f "$SESS_SRC" ]; then
+    cp -f "$SESS_SRC" "$SESS_DST"
+    chmod 0755 "$SESS_DST"
+  fi
+  cat > "$WRAP" << WRAP
+#!/bin/bash
+set -euo pipefail
+ENV_FILE="$ENV_FILE"
+if [ -f "\$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "\$ENV_FILE"
+  set +a
+fi
+exec python3 "$GATE_DST" "\$@"
+WRAP
+  chmod 0755 "$WRAP"
+  if [ -f "$REPO/ensure-wx-watch-gate" ]; then
+    cp -f "$REPO/ensure-wx-watch-gate" "$ENSURE_WRAP"
+    chmod 0755 "$ENSURE_WRAP"
+  fi
+  if [ ! -f "$ENV_FILE" ]; then
+    if [ -f "$ENV_EXAMPLE" ]; then
+      cp "$ENV_EXAMPLE" "$ENV_FILE"
+    else
+      printf 'WX_WATCH_WEBHOOK_URL=\nWX_WATCH_WEBHOOK_KEY=\n' > "$ENV_FILE"
+    fi
+    chmod 600 "$ENV_FILE"
+    log "created empty $ENV_FILE (chmod 600); dry-run until filled"
+  else
+    chmod 600 "$ENV_FILE" || true
+  fi
+  log "installed $GATE_DST and $WRAP"
+}
+
+pid_running() {
+  local pid
+  if [ ! -f "$PID_FILE" ]; then
+    return 1
+  fi
+  pid=$(tr -d ' \n' < "$PID_FILE" || true)
+  [ -n "${pid:-}" ] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+stop_daemon() {
+  if command -v systemctl >/dev/null 2>&1 && systemctl --user status wx-watch-gate.service >/dev/null 2>&1; then
+    systemctl --user stop wx-watch-gate.service || true
+  fi
+  if pid_running; then
+    local pid
+    pid=$(tr -d ' \n' < "$PID_FILE")
+    log "stopping pid $pid"
+    kill "$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.2
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$PID_FILE"
+}
+
+try_systemd() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl --user show-environment >/dev/null 2>&1 || return 1
+  mkdir -p "$UNIT_DIR"
+  cat > "$UNIT_DIR/wx-watch-gate.service" << UNIT
+[Unit]
+Description=WeChat watch gate (ping Grok Bot only on incoming)
+After=default.target
+
+[Service]
+Type=simple
+EnvironmentFile=-$ENV_FILE
+ExecStart=/usr/bin/python3 $GATE_DST --loop
+Restart=always
+RestartSec=5
+WorkingDirectory=$REPO
+
+[Install]
+WantedBy=default.target
+UNIT
+  systemctl --user daemon-reload
+  systemctl --user enable --now wx-watch-gate.service
+  log "started via systemd --user wx-watch-gate.service"
+  return 0
+}
+
+start_nohup() {
+  mkdir -p "$WATCH"
+  : >> "$LOG"
+  nohup python3 "$GATE_DST" --loop >> "$LOG" 2>&1 &
+  echo $! > "$PID_FILE"
+  sleep 0.2
+  if pid_running; then
+    log "started nohup pid $(cat "$PID_FILE") log=$LOG"
+    return 0
+  fi
+  log "ERROR: daemon failed to stay up; see $LOG"
+  return 1
+}
+
+start_daemon() {
+  install_files
+  stop_daemon
+  if try_systemd; then
+    return 0
+  fi
+  start_nohup
+}
+
+status_daemon() {
+  if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active wx-watch-gate.service >/dev/null 2>&1; then
+    systemctl --user is-active wx-watch-gate.service
+    return 0
+  fi
+  if pid_running; then
+    echo "running pid=$(tr -d ' \n' < "$PID_FILE")"
+    return 0
+  fi
+  echo "stopped"
+  return 1
+}
+
+cmd="${1:-start}"
+case "$cmd" in
+  install) install_files ;;
+  start) start_daemon ;;
+  stop) stop_daemon ;;
+  restart) start_daemon ;;
+  status) status_daemon ;;
+  -h|--help) usage ;;
+  *) usage; exit 4 ;;
+esac

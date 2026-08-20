@@ -15,3 +15,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.deb
+
+# Local webhook secrets — never commit real keys
+webhook.env

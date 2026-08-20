@@ -3748,5 +3748,22 @@ class SendHelperTests(unittest.TestCase):
 
 
 
+
+# Load watch-gate unit tests so `python3 tests/test_regions.py` covers them.
+def load_tests(loader, standard_tests, pattern):
+    import importlib.util
+    import os
+    suite = loader.suiteClass()
+    suite.addTests(standard_tests)
+    gate_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_watch_gate.py")
+    if os.path.isfile(gate_path):
+        spec = importlib.util.spec_from_file_location("test_watch_gate", gate_path)
+        if spec is not None and spec.loader is not None:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            suite.addTests(loader.loadTestsFromModule(mod))
+    return suite
+
+
 if __name__ == "__main__":
     unittest.main()
