@@ -21,8 +21,9 @@ python3 tests/test_regions.py
 
 - 不要提交运行时文件：截图、哈希、日志、tessdata、静态 ffmpeg
 - 提交说明写清楚「为什么」
-- 文档请用中文维护（`README.md`、`docs/group-handling.md`、本文件）
+- 文档请用中文维护（`README.md`、`docs/group-handling.md`、`docs/private-send.md`、本文件）
 - 群聊办法见 `docs/group-handling.md`：列表只当信号，必须点进右侧翻历史，任何群都禁止发送或回复
+- 私聊 `--send` 见 `docs/private-send.md`：带 username、不要信假成功、目标已打开就不要点列表
 
 ## 行为边界
 

@@ -134,6 +134,8 @@ export DISPLAY="${DISPLAY:-:8}"
 ./wechat-watch-regions send --username wxid_xxx --text '好' --already-open
 ```
 
+私聊发送的铁律、假 `ok:true`、两个「陈」、剪贴板贴错和撤回，见 **[docs/private-send.md](docs/private-send.md)**。
+
 ### 没有变化
 
 ```
@@ -209,6 +211,7 @@ unread0=5
 ./wechat-watch-regions --send --peer '阿坤' --text '好'
 ./wechat-watch-regions send --peer '阿坤' --text '好'
 ./wechat-watch-regions send --username wxid_xxx --text '好' --already-open
+# 细节和踩坑见 docs/private-send.md
 
 # 当前微信窗口矩形 + nav/list/thread 裁剪（找不到则 1280x800 常量）
 ./wechat-watch-regions --window-geom
@@ -313,6 +316,7 @@ wechat-watch/
 ├── README.md               本文件
 ├── CONTRIBUTING.md         贡献说明
 ├── docs/group-handling.md  群聊处理办法（信号 / 右侧翻历史 / 不发言 / 摘要仓库）
+├── docs/private-send.md    私聊 --send（重名、假成功、剪贴板、撤回）
 ├── wechat-watch.py         薄入口：`python3 wechat-watch.py send --peer … --text …`
 ├── wechat-watch-diff       Bash 入口：列表哈希、滚动才录像、GC
 ├── wechat-watch-regions    Python：差分切框 + OCR + 滚动检测 + 时间线 + 双时区 + 未读标记 + 1:1 --send
@@ -324,7 +328,7 @@ wechat-watch/
 
 ## 群聊 / 右侧对话区
 
-群聊处理办法（列表只当信号、必须点进右侧翻历史、禁止在任何群发言、摘要写到私有仓库、时间同时标 UTC 与 Asia/Shanghai）见 **[docs/group-handling.md](docs/group-handling.md)**。只读助手：`./wechat-watch-thread` 裁当前右侧对话区并 OCR，供写入 [wechat-group-summaries](https://github.com/nicechencs/wechat-group-summaries)。**不要**把私聊 / 群记录提交进本仓库。
+群聊处理办法（列表只当信号、必须点进右侧翻历史、禁止在任何群发言、摘要写到私有仓库、时间同时标 UTC 与 Asia/Shanghai）见 **[docs/group-handling.md](docs/group-handling.md)**。 1:1 `--send` 见 **[docs/private-send.md](docs/private-send.md)**。只读助手：`./wechat-watch-thread` 裁当前右侧对话区并 OCR，供写入 [wechat-group-summaries](https://github.com/nicechencs/wechat-group-summaries)。**不要**把私聊 / 群记录提交进本仓库。
 
 左侧会话列表每一行预览都很短，群聊里「谁说了什么」单靠列表看不清。翻历史时以右侧对话区为准：
 
