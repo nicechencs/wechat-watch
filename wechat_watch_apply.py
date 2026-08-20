@@ -7,8 +7,13 @@ import sys
 import time
 
 
+_RAISE_SLEEP_S = 0.2
+_FOCUS_SESSION_SLEEP_S = 0.3
+_FOCUS_INPUT_SLEEP_S = 0.05
+
+
 def apply_send_plan(plan: dict, x11=None) -> bool:
-    """Click planned x/y, paste via clipboard+ctrl+v, submit Return.
+    """Raise WeChat, click planned x/y, paste via clipboard+ctrl+v, Return.
 
     Never talks to AT-SPI in this process. A missing accessibility bus
     aborts the interpreter (SIGTRAP); clicks go through X11 instead.
@@ -32,11 +37,17 @@ def apply_send_plan(plan: dict, x11=None) -> bool:
     typed = False
     submitted = False
     try:
+        wid = plan.get("window_id") or plan.get("id")
+        driver.raise_window(None if not wid else str(wid))
+        time.sleep(_RAISE_SLEEP_S)
         for step in actions:
             op = step.get("op")
-            if op in ("focus-session", "focus-input"):
+            if op == "focus-session":
                 driver.click(int(step["x"]), int(step["y"]))
-                time.sleep(0.05)
+                time.sleep(_FOCUS_SESSION_SLEEP_S)
+            elif op == "focus-input":
+                driver.click(int(step["x"]), int(step["y"]))
+                time.sleep(_FOCUS_INPUT_SLEEP_S)
             elif op == "type":
                 body = str(step.get("text") or text)
                 driver.paste(body)
@@ -70,6 +81,13 @@ def _refused_send_peer(peer: str) -> bool:
 
 class X11SendDriver:
     """Absolute-coordinate click / clipboard paste / Return via X11."""
+
+    def raise_window(self, win_id: str | None = None) -> None:
+        """Map-raise and activate WeChat so XTEST keys do not hit another client."""
+        wid = (win_id or "").strip() or _find_send_window_id()
+        if _xlib_raise(wid) or _ctypes_raise(wid) or _xdotool_raise(wid) or _wmctrl_raise(wid):
+            return
+        raise RuntimeError("x11-raise-failed")
 
     def click(self, x: int, y: int) -> None:
         if _xlib_click(x, y):
@@ -185,6 +203,33 @@ class _ClipboardOwner:
 
 def _display_name() -> bytes:
     return os.environ.get("DISPLAY", ":8").encode("ascii", "replace")
+
+
+def _parse_xid(win_id: str | None) -> int | None:
+    raw = (win_id or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw, 16) if raw.lower().startswith("0x") else int(raw)
+    except ValueError:
+        return None
+
+
+def _find_send_window_id() -> str:
+    spec = (os.environ.get("WECHAT_WINDOW_ID") or "").strip()
+    if spec:
+        return spec
+    mod = sys.modules.get("wechat_watch_regions")
+    if mod is not None:
+        finder = getattr(mod, "find_window_id", None)
+        if callable(finder):
+            try:
+                found = finder(probe=True)
+            except Exception:
+                found = None
+            if found:
+                return str(found)
+    return _xdotool_search_wechat() or _wmctrl_search_wechat() or ""
 
 
 def _xlib_mods():
@@ -363,6 +408,257 @@ def _xtest_hotkey(mod: str, key: str) -> bool:
         return False
     finally:
         x11.XCloseDisplay(dpy)
+
+
+def _xlib_raise(win_id: str) -> bool:
+    xid = _parse_xid(win_id)
+    if xid is None:
+        return False
+    mods = _xlib_mods()
+    if mods is None:
+        return False
+    X, display, _xtest = mods
+    try:
+        from Xlib.protocol import event
+
+        dpy = display.Display()
+        root = dpy.screen().root
+        win = dpy.create_resource_object("window", xid)
+        win.map()
+        win.configure(stack_mode=X.Above)
+        try:
+            win.set_input_focus(X.RevertToParent, X.CurrentTime)
+        except Exception:
+            pass
+        atom = dpy.intern_atom("_NET_ACTIVE_WINDOW")
+        ev = event.ClientMessage(
+            window=win,
+            client_type=atom,
+            data=(32, [1, X.CurrentTime, 0, 0, 0]),
+        )
+        mask = X.SubstructureRedirectMask | X.SubstructureNotifyMask
+        root.send_event(ev, event_mask=mask)
+        dpy.flush()
+        dpy.close()
+        return True
+    except Exception:
+        return False
+
+
+def _ctypes_raise(win_id: str) -> bool:
+    xid = _parse_xid(win_id)
+    if xid is None:
+        return False
+    try:
+        from ctypes import (
+            Structure,
+            byref,
+            c_char_p,
+            c_int,
+            c_long,
+            c_ulong,
+            c_void_p,
+            cdll,
+        )
+
+        x11 = cdll.LoadLibrary("libX11.so.6")
+        x11.XOpenDisplay.restype = c_void_p
+        x11.XOpenDisplay.argtypes = [c_char_p]
+        x11.XCloseDisplay.argtypes = [c_void_p]
+        x11.XFlush.argtypes = [c_void_p]
+        x11.XDefaultScreen.restype = c_int
+        x11.XDefaultScreen.argtypes = [c_void_p]
+        x11.XRootWindow.restype = c_ulong
+        x11.XRootWindow.argtypes = [c_void_p, c_int]
+        x11.XMapRaised.argtypes = [c_void_p, c_ulong]
+        x11.XRaiseWindow.argtypes = [c_void_p, c_ulong]
+        x11.XSetInputFocus.argtypes = [c_void_p, c_ulong, c_int, c_ulong]
+        x11.XInternAtom.restype = c_ulong
+        x11.XInternAtom.argtypes = [c_void_p, c_char_p, c_int]
+        x11.XSendEvent.argtypes = [c_void_p, c_ulong, c_int, c_long, c_void_p]
+    except Exception:
+        return False
+
+    class _ClientMessage(Structure):
+        _fields_ = [
+            ("type", c_int),
+            ("serial", c_ulong),
+            ("send_event", c_int),
+            ("display", c_void_p),
+            ("window", c_ulong),
+            ("message_type", c_ulong),
+            ("format", c_int),
+            ("data", c_long * 5),
+        ]
+
+    dpy = x11.XOpenDisplay(_display_name())
+    if not dpy:
+        return False
+    try:
+        screen = x11.XDefaultScreen(dpy)
+        root = x11.XRootWindow(dpy, screen)
+        x11.XMapRaised(dpy, xid)
+        x11.XRaiseWindow(dpy, xid)
+        revert_to_parent = 2
+        x11.XSetInputFocus(dpy, xid, revert_to_parent, 0)
+        atom = x11.XInternAtom(dpy, b"_NET_ACTIVE_WINDOW", 0)
+        ev = _ClientMessage()
+        ev.type = 33  # ClientMessage
+        ev.serial = 0
+        ev.send_event = 1
+        ev.display = dpy
+        ev.window = xid
+        ev.message_type = atom
+        ev.format = 32
+        ev.data[0] = 1
+        ev.data[1] = 0
+        ev.data[2] = 0
+        ev.data[3] = 0
+        ev.data[4] = 0
+        mask = (1 << 19) | (1 << 20)  # SubstructureNotify | SubstructureRedirect
+        x11.XSendEvent(dpy, root, 0, mask, byref(ev))
+        x11.XFlush(dpy)
+        return True
+    except Exception:
+        return False
+    finally:
+        x11.XCloseDisplay(dpy)
+
+
+def _xid_tokens(win_id: str) -> list[str]:
+    raw = (win_id or "").strip()
+    if not raw:
+        return []
+    out = [raw]
+    xid = _parse_xid(raw)
+    if xid is None:
+        return out
+    hex_id = hex(xid)
+    dec_id = str(xid)
+    for tok in (hex_id, dec_id):
+        if tok not in out:
+            out.append(tok)
+    return out
+
+
+def _xdotool_search_wechat() -> str:
+    exe = shutil.which("xdotool")
+    if not exe:
+        return ""
+    for args in (
+        ["search", "--onlyvisible", "--class", "wechat"],
+        ["search", "--onlyvisible", "--name", "WeChat"],
+        ["search", "--onlyvisible", "--name", "微信"],
+        ["search", "--class", "wechat"],
+        ["search", "--name", "WeChat"],
+    ):
+        try:
+            proc = subprocess.run(
+                [exe, *args],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=4,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode != 0:
+            continue
+        for line in (proc.stdout or "").splitlines():
+            tok = line.strip()
+            if tok.isdigit() or tok.lower().startswith("0x"):
+                return tok
+    return ""
+
+
+def _wmctrl_search_wechat() -> str:
+    exe = shutil.which("wmctrl")
+    if not exe:
+        return ""
+    try:
+        proc = subprocess.run(
+            [exe, "-lx"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=4,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    best = ""
+    for line in (proc.stdout or "").splitlines():
+        low = line.lower()
+        if "wechat-watch" in low:
+            continue
+        if any(k in low or k in line for k in ("wechat", "weixin", "微信")):
+            tok = line.split(None, 1)[0] if line.strip() else ""
+            if tok.lower().startswith("0x") or tok.isdigit():
+                best = tok
+                break
+    return best
+
+
+def _xdotool_raise(win_id: str) -> bool:
+    for tok in _xid_tokens(win_id):
+        if _xdotool("windowactivate", "--sync", tok) or _xdotool("windowraise", tok):
+            return True
+    exe = shutil.which("xdotool")
+    if not exe:
+        return False
+    for args in (
+        ["search", "--onlyvisible", "--class", "wechat", "windowactivate", "--sync"],
+        ["search", "--onlyvisible", "--name", "WeChat", "windowactivate", "--sync"],
+        ["search", "--onlyvisible", "--name", "微信", "windowactivate", "--sync"],
+    ):
+        try:
+            proc = subprocess.run(
+                [exe, *args],
+                check=False,
+                capture_output=True,
+                timeout=4,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode == 0:
+            return True
+    return False
+
+
+def _wmctrl_raise(win_id: str) -> bool:
+    exe = shutil.which("wmctrl")
+    if not exe:
+        return False
+    env = os.environ.copy()
+    env.setdefault("DISPLAY", env.get("DISPLAY", ":8"))
+    for tok in _xid_tokens(win_id):
+        try:
+            proc = subprocess.run(
+                [exe, "-i", "-a", tok],
+                check=False,
+                capture_output=True,
+                timeout=4,
+                env=env,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode == 0:
+            return True
+    for name in ("WeChat", "微信", "weixin"):
+        try:
+            proc = subprocess.run(
+                [exe, "-a", name],
+                check=False,
+                capture_output=True,
+                timeout=4,
+                env=env,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode == 0:
+            return True
+    return False
 
 
 def _xdotool(*args: str) -> bool:

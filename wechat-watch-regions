@@ -38,6 +38,7 @@ Usage:
       [--dry-run] [--sessions-json FILE] [--already-open]
       # 1:1 only; refuse groups / empty text / File Transfer / Weixin Team
       # --username alone is enough when unique; no --sessions-json loads wx-cli
+      # with --data-dir ($WX_LINUX_DATA or /home/box/wx-linux-read/data)
       # also: wechat-watch-regions send --peer PEER --text TEXT
 """
 from __future__ import annotations
@@ -3839,14 +3840,21 @@ def load_sessions_json(path: str) -> list:
 
 
 _DEFAULT_WX_CLI = "/home/box/wx-linux-read/wx-cli"
+_DEFAULT_WX_DATA = "/home/box/wx-linux-read/data"
 
 
 def load_sessions_wxcli(cli: str | None = None) -> list:
-    """`wx-cli chat sessions --limit 50 --json` (or $WX_CLI). Never OCR."""
+    """`wx-cli chat sessions --limit 50 --json` (or $WX_CLI). Never OCR.
+
+    wx-cli defaults its data dir to cwd/data; send often runs elsewhere, so
+    pass --data-dir ($WX_LINUX_DATA or the wx-linux-read data root). Never
+    unlock / derive / scan.
+    """
     path = (cli if cli is not None else os.environ.get("WX_CLI") or _DEFAULT_WX_CLI).strip()
     if not path or not os.path.isfile(path):
         return []
-    cmd = [path, "chat", "sessions", "--limit", "50", "--json"]
+    data_dir = (os.environ.get("WX_LINUX_DATA") or "").strip() or _DEFAULT_WX_DATA
+    cmd = [path, "--data-dir", data_dir, "chat", "sessions", "--limit", "50", "--json"]
     if not os.access(path, os.X_OK):
         cmd = [sys.executable, *cmd]
     try:
@@ -3946,14 +3954,17 @@ class DrySendDriver:
 
 def execute_send_plan(plan: dict, driver: DrySendDriver) -> None:
     banned = {"search", "add-contact", "new-chat", "compose-new"}
-    for step in plan.get("actions") or []:
+    actions = list(plan.get("actions") or [])
+    if any((step.get("op") in banned) for step in actions):
+        raise SendRefused(
+            "unsafe-action",
+            peer=str(plan.get("peer") or ""),
+            text=str(plan.get("text") or ""),
+        )
+    wid = plan.get("window_id") or plan.get("id")
+    driver.raise_window(None if not wid else str(wid))
+    for step in actions:
         op = step.get("op")
-        if op in banned:
-            raise SendRefused(
-                "unsafe-action",
-                peer=str(plan.get("peer") or ""),
-                text=str(plan.get("text") or ""),
-            )
         if op == "focus-session":
             driver.focus_xy(int(step["x"]), int(step["y"]), "session")
         elif op == "focus-input":
@@ -4078,6 +4089,9 @@ def run_send(
             'plan': plan,
             'source': source,
         }
+    wid = find_window_id(env=env, tree_text=tree_text, probe=probe_window)
+    if wid:
+        plan['window_id'] = wid
     if driver is not None:
         execute_send_plan(plan, driver)
         return {'ok': True, 'peer': plan['peer'], 'text': plan['text']}
@@ -4119,7 +4133,7 @@ def cli_send(args) -> int:
             username=username,
             sessions=sessions,
             dry_run=dry,
-            probe_window=False,
+            probe_window=not dry,
             already_open=bool(getattr(args, "already_open", False)),
         )
     except SendRefused as exc:

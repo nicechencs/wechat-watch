@@ -127,7 +127,9 @@ export DISPLAY="${DISPLAY:-:8}"
 
 # 已登录窗口里给已有私聊发一条短文本（不要对群用）
 # 实况点按走 X11，不在本进程调 AT-SPI（无障碍总线缺失时 Atspi 会 SIGTRAP 整进程）
-# 省略 --sessions-json 时读 wx-cli chat sessions（或 $WX_CLI），不要 OCR 过期 list.png
+# 发送前先 raise/activate 微信窗口，避免 Ctrl+V / Return 落到覆盖着的终端
+# 省略 --sessions-json 时读 wx-cli chat sessions（或 $WX_CLI），并传 --data-dir
+# （$WX_LINUX_DATA 或 /home/box/wx-linux-read/data），不要 OCR 过期 list.png
 ./wechat-watch-regions --send --peer '阿坤' --text '好'
 ./wechat-watch-regions send --username wxid_xxx --text '好' --already-open
 ```

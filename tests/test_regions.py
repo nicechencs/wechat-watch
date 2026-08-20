@@ -2675,6 +2675,7 @@ class SendHelperTests(unittest.TestCase):
         self.assertEqual(result["peer"], "阿坤")
         self.assertEqual(result["text"], "好")
         ops = [c["op"] for c in drv.calls]
+        self.assertEqual(ops[0], "raise")
         self.assertIn("focus", ops)
         self.assertIn("type", ops)
         self.assertIn("submit", ops)
@@ -2824,7 +2825,9 @@ class SendHelperTests(unittest.TestCase):
     def test_dry_run_never_calls_apply(self):
         with patch("wechat_watch_apply.apply_send_plan") as geom, patch(
             "wechat_watch_apply.apply_private_text"
-        ) as apply:
+        ) as apply, patch.object(
+            regions, "execute_send_plan"
+        ) as execute:
             geom.return_value = True
             apply.return_value = True
             result = regions.run_send(
@@ -2838,6 +2841,7 @@ class SendHelperTests(unittest.TestCase):
             self.assertTrue(result.get("dry_run"))
             geom.assert_not_called()
             apply.assert_not_called()
+            execute.assert_not_called()
 
     def test_stub_apply_invoked_once(self):
         with patch("wechat_watch_apply.apply_send_plan") as geom, patch(
@@ -2884,6 +2888,23 @@ class SendHelperTests(unittest.TestCase):
         run_ops = [a["op"] for a in result["plan"]["actions"]]
         self.assertNotIn("focus-session", run_ops)
         self.assertEqual(run_ops[0], "focus-input")
+
+        drv = regions.DrySendDriver()
+        live = regions.run_send(
+            "阿坤",
+            "好",
+            sessions=[{"name": "阿坤", "row": 1}],
+            dry_run=False,
+            driver=drv,
+            probe_window=False,
+            already_open=True,
+        )
+        self.assertTrue(live["ok"])
+        drv_ops = [c["op"] for c in drv.calls]
+        self.assertEqual(drv_ops[0], "raise")
+        kinds = {c.get("kind") for c in drv.calls if c.get("op") == "focus"}
+        self.assertNotIn("session", kinds)
+        self.assertIn("input", kinds)
 
     def test_two_chen_username_disambiguates(self):
         sessions = [
@@ -2967,15 +2988,19 @@ class SendHelperTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as td:
             stub = os.path.join(td, "wx-cli")
+            argv_path = os.path.join(td, "argv.txt")
             with open(stub, "w", encoding="utf-8") as fh:
                 fh.write("#!/usr/bin/env python3\n")
-                fh.write("import json\n")
+                fh.write("import json, os, sys\n")
+                fh.write("open(os.environ['WX_CLI_ARGV'], 'w', encoding='utf-8').write('\\n'.join(sys.argv))\n")
                 fh.write("print(json.dumps(")
                 fh.write(repr(payload))
                 fh.write(", ensure_ascii=False))\n")
             os.chmod(stub, 0o755)
             env = os.environ.copy()
             env["WX_CLI"] = stub
+            env["WX_CLI_ARGV"] = argv_path
+            env.pop("WX_LINUX_DATA", None)
             proc = subprocess.run(
                 [
                     sys.executable,
@@ -2997,6 +3022,34 @@ class SendHelperTests(unittest.TestCase):
             self.assertEqual(rec["peer"], "阿坤")
             self.assertEqual(rec["text"], "好")
             self.assertNotIn("error", rec)
+            with open(argv_path, encoding="utf-8") as fh:
+                argv = [ln.strip() for ln in fh.read().splitlines() if ln.strip()]
+            self.assertIn("--data-dir", argv)
+            data_idx = argv.index("--data-dir")
+            self.assertLess(data_idx + 1, len(argv))
+            self.assertEqual(argv[data_idx + 1], "/home/box/wx-linux-read/data")
+
+            env["WX_LINUX_DATA"] = os.path.join(td, "wx-data")
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPT,
+                    "send",
+                    "--username",
+                    "wxid_0svgaau5drvs12",
+                    "--text",
+                    "好",
+                    "--dry-run",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            with open(argv_path, encoding="utf-8") as fh:
+                argv = [ln.strip() for ln in fh.read().splitlines() if ln.strip()]
+            self.assertIn("--data-dir", argv)
+            self.assertEqual(argv[argv.index("--data-dir") + 1], env["WX_LINUX_DATA"])
 
             proc = subprocess.run(
                 [
@@ -3032,6 +3085,9 @@ class SendHelperTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
+            def raise_window(self, win_id=None):
+                self.calls.append(("raise", win_id or ""))
+
             def click(self, x, y):
                 self.calls.append(("click", int(x), int(y)))
 
@@ -3054,6 +3110,7 @@ class SendHelperTests(unittest.TestCase):
         plan = {
             "peer": "阿坤",
             "text": "你好",
+            "window_id": "0xabc",
             "actions": [
                 {"op": "focus-session", "x": 80, "y": 120},
                 {"op": "focus-input", "x": 500, "y": 760},
@@ -3067,18 +3124,23 @@ class SendHelperTests(unittest.TestCase):
             "gi.repository": AbortAtspi("gi.repository"),
             "gi.repository.Atspi": AbortAtspi("gi.repository.Atspi"),
         }
-        with patch.dict(sys.modules, planted):
+        with patch.dict(sys.modules, planted), patch(
+            "wechat_watch_apply.time.sleep"
+        ):
             ok = apply_mod.apply_send_plan(plan, x11=fake)
         self.assertTrue(ok)
         self.assertEqual(
             fake.calls,
             [
+                ("raise", "0xabc"),
                 ("click", 80, 120),
                 ("click", 500, 760),
                 ("paste", "你好"),
                 ("submit",),
             ],
         )
+        self.assertEqual(fake.calls[0][0], "raise")
+        self.assertEqual(fake.calls[1][0], "click")
 
         boom = apply_mod.X11SendDriver
 
@@ -3088,9 +3150,83 @@ class SendHelperTests(unittest.TestCase):
 
         with patch.object(apply_mod, "X11SendDriver", side_effect=abort_default):
             fake2 = FakeX11()
-            ok = apply_mod.apply_send_plan(plan, x11=fake2)
+            with patch("wechat_watch_apply.time.sleep"):
+                ok = apply_mod.apply_send_plan(plan, x11=fake2)
             self.assertTrue(ok)
+            self.assertEqual(fake2.calls[0][0], "raise")
             self.assertEqual(fake2.calls[-1], ("submit",))
+
+    def test_apply_and_execute_raise_before_click(self):
+        import wechat_watch_apply as apply_mod
+
+        src = inspect.getsource(apply_mod.apply_send_plan)
+        self.assertIn("raise_window", src)
+        self.assertIn("_RAISE_SLEEP_S", src)
+        self.assertIn("_FOCUS_SESSION_SLEEP_S", src)
+        self.assertGreaterEqual(apply_mod._RAISE_SLEEP_S, 0.2)
+        self.assertGreaterEqual(apply_mod._FOCUS_SESSION_SLEEP_S, 0.3)
+
+        class FakeX11:
+            def __init__(self):
+                self.calls = []
+
+            def raise_window(self, win_id=None):
+                self.calls.append(("raise", win_id or ""))
+
+            def click(self, x, y):
+                self.calls.append(("click", int(x), int(y)))
+
+            def paste(self, text):
+                self.calls.append(("paste", text))
+
+            def submit(self):
+                self.calls.append(("submit",))
+
+        plan = {
+            "peer": "陈",
+            "text": "好",
+            "window_id": "0x200007",
+            "actions": [
+                {"op": "focus-session", "x": 272, "y": 277},
+                {"op": "focus-input", "x": 657, "y": 706},
+                {"op": "type", "text": "好"},
+                {"op": "submit"},
+            ],
+        }
+        fake = FakeX11()
+        with patch("wechat_watch_apply.time.sleep") as slept:
+            ok = apply_mod.apply_send_plan(plan, x11=fake)
+        self.assertTrue(ok)
+        self.assertEqual(fake.calls[0], ("raise", "0x200007"))
+        self.assertEqual(fake.calls[1], ("click", 272, 277))
+        delays = [c.args[0] for c in slept.call_args_list]
+        self.assertGreaterEqual(delays[0], 0.2)
+        self.assertGreaterEqual(delays[1], 0.3)
+
+        already = {
+            "peer": "陈",
+            "text": "好",
+            "window_id": "0x200007",
+            "actions": [
+                {"op": "focus-input", "x": 657, "y": 706},
+                {"op": "type", "text": "好"},
+                {"op": "submit"},
+            ],
+        }
+        fake2 = FakeX11()
+        with patch("wechat_watch_apply.time.sleep"):
+            ok = apply_mod.apply_send_plan(already, x11=fake2)
+        self.assertTrue(ok)
+        self.assertEqual(fake2.calls[0][0], "raise")
+        self.assertEqual(fake2.calls[1], ("click", 657, 706))
+        self.assertNotIn(("click", 272, 277), fake2.calls)
+
+        drv = regions.DrySendDriver()
+        regions.execute_send_plan(plan, drv)
+        self.assertEqual(drv.calls[0]["op"], "raise")
+        self.assertEqual(drv.calls[0].get("id"), "0x200007")
+        self.assertEqual(drv.calls[1]["op"], "focus")
+        self.assertEqual(drv.calls[1]["kind"], "session")
 
     def test_geom_fail_falls_back_to_private_apply(self):
         with patch("wechat_watch_apply.apply_send_plan") as geom, patch(
